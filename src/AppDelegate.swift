@@ -123,6 +123,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var keyMonitor: Any?
     private var clickMonitor: Any?
 
+    // Search-folder picker (⌘G)
+    private var isEditingPath = false
+    private var searchIcon: NSImageView?
+    private var pathIcon: NSImageView?
+    private var pathField: NSTextField?
+    private var pickerPaths: [String] = []
+    private var pickerItems: [SearchableItem] = []
+
     // Data
     private var allItems: [SearchableItem] = []
     private var filteredMatches: [MatchResult] = []
@@ -137,6 +145,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private var previewView: QLPreviewView?
     private var playerView: AVPlayerView?
     private var artworkView: NSImageView?
+    private var audioTitleLabel: NSTextField?
+    private var audioArtistLabel: NSTextField?
+    private var previewDivider: NSBox?
     private var previewFrame: NSRect = .zero
     /// Custom field editor so query tags get rounded backgrounds.
     private lazy var tagFieldEditor: NSTextView = makeTagFieldEditor()
@@ -180,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         setupTable()
         setupPreview()
         setupFooter()
+        setupPathEditor()
         installKeyMonitor()
         installClickMonitor()
         installFocusObserver()
@@ -295,6 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             .withSymbolConfiguration(symbolConfig)
         icon.contentTintColor = .secondaryLabelColor
         container.addSubview(icon)
+        searchIcon = icon
 
         searchField = NSSearchField(frame: NSRect(
             x: 44,
@@ -370,6 +383,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let divider = NSBox(frame: NSRect(x: previewX - 1, y: footerHeight, width: 1, height: tableHeight))
         divider.boxType = .separator
         container.addSubview(divider)
+        previewDivider = divider
 
         previewFrame = NSRect(x: previewX, y: footerHeight, width: previewWidth, height: tableHeight)
 
@@ -388,12 +402,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         container.addSubview(art)
         artworkView = art
 
+        // Title / artist caption shown below the artwork.
+        let title = NSTextField(labelWithString: "")
+        title.alignment = .center
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        title.lineBreakMode = .byTruncatingTail
+        title.isHidden = true
+        container.addSubview(title)
+        audioTitleLabel = title
+
+        let artist = NSTextField(labelWithString: "")
+        artist.alignment = .center
+        artist.font = .systemFont(ofSize: 11, weight: .regular)
+        artist.textColor = .secondaryLabelColor
+        artist.lineBreakMode = .byTruncatingTail
+        artist.isHidden = true
+        container.addSubview(artist)
+        audioArtistLabel = artist
+
         // AVPlayer for audio/video so playback can be controlled (Tab).
         let player = AVPlayerView(frame: previewFrame)
         player.controlsStyle = .inline
         player.isHidden = true
         container.addSubview(player)
         playerView = player
+    }
+
+    /// Shows/hides the preview pane (and gives the list the full width while
+    /// picking a search folder, where no preview is needed).
+    private func setPreviewPaneVisible(_ visible: Bool) {
+        guard showsPreview, let container = window.contentView else { return }
+        previewDivider?.isHidden = !visible
+        previewView?.isHidden = !visible
+        if !visible {
+            stopPlayer()
+            artworkView?.isHidden = true
+            audioTitleLabel?.isHidden = true
+            audioArtistLabel?.isHidden = true
+            playerView?.isHidden = true
+        }
+        let width = visible ? listWidth(in: container) : container.bounds.width
+        scrollView.frame.size.width = width
+        tableView.frame.size.width = width
+        tableView.tableColumns.first?.width = width
     }
 
     private func setupFooter() {
@@ -437,8 +488,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             footerLabel.centerYAnchor.constraint(equalTo: stack.centerYAnchor)
         ])
 
-        // Right (file search only): type filter.
+        // Right (file search only): folder picker, plus type filter.
         if config.mode == .files && !config.searchApps {
+            let folderButton = NSButton(
+                image: NSImage(systemSymbolName: "folder", accessibilityDescription: "Search folder") ?? NSImage(),
+                target: self,
+                action: #selector(footerChangeFolder)
+            )
+            folderButton.imagePosition = .imageOnly
+            folderButton.bezelStyle = .rounded
+            folderButton.controlSize = .small
+            folderButton.toolTip = "Change search folder (⌘G)"
+            folderButton.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(folderButton)
+            NSLayoutConstraint.activate([
+                folderButton.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+                folderButton.centerYAnchor.constraint(equalTo: stack.centerYAnchor)
+            ])
+
             let popup = NSPopUpButton(frame: .zero, pullsDown: false)
             popup.translatesAutoresizingMaskIntoConstraints = false
             for choice in Self.typeChoices { popup.addItem(withTitle: choice.title) }
@@ -446,7 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             popup.action = #selector(typeChanged(_:))
             container.addSubview(popup)
             NSLayoutConstraint.activate([
-                popup.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -12),
+                popup.trailingAnchor.constraint(equalTo: folderButton.leadingAnchor, constant: -8),
                 popup.centerYAnchor.constraint(equalTo: stack.centerYAnchor),
                 popup.widthAnchor.constraint(equalToConstant: 130)
             ])
@@ -475,18 +542,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc private func footerOpen() {
+        guard !isEditingPath else { return }
         config.enterAction = .open
         selectCurrent()
     }
 
     @objc private func footerReveal() {
+        guard !isEditingPath else { return }
         config.enterAction = .reveal
         selectCurrent()
     }
 
     /// "Return" button: same as Enter — return the path (or apply --enter).
     @objc private func footerReturn() {
+        guard !isEditingPath else { return }
         selectCurrent()
+    }
+
+    @objc private func footerChangeFolder() {
+        beginPathEditing()
     }
 
     @objc private func typeChanged(_ sender: NSPopUpButton) {
@@ -497,6 +571,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tableView.reloadData()
         updateFooter()
         loadFiles()
+    }
+
+    // MARK: - Search-folder editor
+
+    private func setupPathEditor() {
+        guard config.mode == .files, !config.searchApps, let container = window.contentView else { return }
+
+        let icon = NSImageView(frame: searchIcon?.frame ?? .zero)
+        icon.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Folder")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 17, weight: .regular))
+        icon.contentTintColor = .controlAccentColor
+        icon.isHidden = true
+        container.addSubview(icon)
+        pathIcon = icon
+
+        let field = NSTextField(frame: searchField.frame)
+        field.delegate = self
+        field.font = NSFont.systemFont(ofSize: 16, weight: .regular)
+        field.textColor = .labelColor
+        field.drawsBackground = false
+        field.isBezeled = false
+        field.isBordered = false
+        field.focusRingType = .none
+        field.placeholderString = "Search folder"
+        field.autoresizingMask = [.width]
+        field.isHidden = true
+        container.addSubview(field)
+        pathField = field
+    }
+
+    private func beginPathEditing() {
+        guard config.mode == .files, !config.searchApps, !isEditingPath,
+              let pathField, let pathIcon else { return }
+        isEditingPath = true
+        pickerPaths.removeAll()
+        pickerItems.removeAll()
+
+        let seed = config.searchPaths.first ?? FileManager.default.currentDirectoryPath
+        pathField.stringValue = seed
+        searchField.isHidden = true
+        searchIcon?.isHidden = true
+        pathIcon.isHidden = false
+        pathField.isHidden = false
+        // Keep focus in the path field: clicking the list must not steal it.
+        tableView.refusesFirstResponder = true
+        setPreviewPaneVisible(false)
+
+        window.makeFirstResponder(pathField)
+        if let editor = pathField.currentEditor() {
+            editor.selectedRange = NSRange(location: (seed as NSString).length, length: 0)
+        }
+        updatePicker()
+    }
+
+    private func endPathEditing() {
+        isEditingPath = false
+        pathField?.isHidden = true
+        pathIcon?.isHidden = true
+        pickerPaths.removeAll()
+        pickerItems.removeAll()
+        tableView.refusesFirstResponder = false
+        searchIcon?.isHidden = false
+        searchField.isHidden = false
+        setPreviewPaneVisible(true)
+
+        window.makeFirstResponder(searchField)
+        tableView.reloadData()
+        if !filteredMatches.isEmpty {
+            selectRow(0)
+        } else {
+            updatePreview()
+        }
+        updateFooter()
+    }
+
+    private func togglePathEditing() {
+        if isEditingPath {
+            endPathEditing()
+        } else {
+            beginPathEditing()
+        }
+    }
+
+    private func commitPathEditing() {
+        guard isEditingPath, let pathField else { return }
+        let raw = pathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expanded = (raw as NSString).expandingTildeInPath
+
+        var isDir: ObjCBool = false
+        guard !expanded.isEmpty,
+              FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir),
+              isDir.boolValue else {
+            NSSound.beep()
+            return
+        }
+
+        config.searchPaths = [expanded]
+        allItems.removeAll()
+        filteredMatches.removeAll()
+        previewedURL = nil
+
+        endPathEditing()
+        loadFiles()
+        updateFooter()
+    }
+
+    /// Lists the folders under the path currently typed in the picker.
+    private func updatePicker() {
+        guard isEditingPath, let pathField else { return }
+
+        pickerPaths = PathCompleter.directoryCompletions(
+            for: pathField.stringValue,
+            includeHidden: config.includeHidden
+        )
+        pickerItems = pickerPaths.map {
+            SearchableItem(url: URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath), isDirectory: true)
+        }
+        tableView.reloadData()
+        if !pickerItems.isEmpty {
+            selectRow(0)
+        }
+        updateFooter()
+    }
+
+    /// Completes the highlighted folder: descends into it and refreshes the list.
+    private func completePickerSelection() {
+        guard isEditingPath, let pathField else { return }
+        let row = tableView.selectedRow
+        guard pickerPaths.indices.contains(row) else { return }
+        let value = pickerPaths[row]
+        pathField.stringValue = value
+        if let editor = pathField.currentEditor() {
+            editor.selectedRange = NSRange(location: (value as NSString).length, length: 0)
+        }
+        updatePicker()
     }
 
     // MARK: - Input loading
@@ -667,6 +876,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Footer
 
     private func updateFooter() {
+        if isEditingPath {
+            footerLabel.stringValue = "Choose folder · \(pickerItems.count) folders"
+            return
+        }
+
         let total = allItems.count
         let visible = filteredMatches.count
 
@@ -691,7 +905,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Table view data source / delegate
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        return filteredMatches.count
+        return displayedItemCount
     }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
@@ -703,9 +917,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard filteredMatches.indices.contains(row) else { return nil }
-        let match = filteredMatches[row]
-        let item = match.item
+        let item: SearchableItem
+        let match: MatchResult?
+        if isEditingPath {
+            guard pickerItems.indices.contains(row) else { return nil }
+            item = pickerItems[row]
+            match = nil
+        } else {
+            guard filteredMatches.indices.contains(row) else { return nil }
+            let result = filteredMatches[row]
+            match = result
+            item = result.item
+        }
+        let nameHighlights = match.map { nameHighlightPositions(for: item, match: $0) } ?? []
+        let pathHighlights = match.map { pathHighlightPositions(for: item, match: $0) } ?? []
 
         let cell = NSTableCellView()
         cell.identifier = NSUserInterfaceItemIdentifier("ItemCell")
@@ -720,7 +945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         nameField.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(750), for: .horizontal)
         nameField.attributedStringValue = attributedText(
             item.displayName,
-            termHighlights: nameHighlightPositions(for: item, match: match),
+            termHighlights: nameHighlights,
             color: .labelColor,
             font: NSFont.systemFont(ofSize: 14, weight: .regular)
         )
@@ -772,7 +997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             pathField.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(250), for: .horizontal)
             pathField.attributedStringValue = attributedText(
                 item.parentPath,
-                termHighlights: pathHighlightPositions(for: item, match: match),
+                termHighlights: pathHighlights,
                 color: .tertiaryLabelColor,
                 font: NSFont.systemFont(ofSize: 11, weight: .regular)
             )
@@ -853,19 +1078,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     // MARK: - Selection
 
+    private var displayedItemCount: Int {
+        isEditingPath ? pickerItems.count : filteredMatches.count
+    }
+
     private func selectRow(_ index: Int) {
-        guard filteredMatches.indices.contains(index) else { return }
+        guard index >= 0, index < displayedItemCount else { return }
         tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         tableView.scrollRowToVisible(index)
         updatePreview()
     }
 
     private func moveSelection(_ offset: Int) {
-        guard !filteredMatches.isEmpty else { return }
+        let count = displayedItemCount
+        guard count > 0 else { return }
         let current = tableView.selectedRow
         var next = current + offset
         if next < 0 { next = 0 }
-        if next >= filteredMatches.count { next = filteredMatches.count - 1 }
+        if next >= count { next = count - 1 }
         selectRow(next)
     }
 
@@ -878,6 +1108,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func chooseRow(_ index: Int) {
+        if isEditingPath {
+            guard pickerItems.indices.contains(index) else { return }
+            selectRow(index)
+            completePickerSelection()
+            return
+        }
         guard filteredMatches.indices.contains(index) else { return }
         selectRow(index)
         selectCurrent()
@@ -885,6 +1121,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     @objc private func handleClick() {
         let row = tableView.clickedRow >= 0 ? tableView.clickedRow : tableView.selectedRow
+        if isEditingPath {
+            // Left-click a folder to select and complete (descend into) it.
+            guard pickerItems.indices.contains(row) else { return }
+            selectRow(row)
+            completePickerSelection()
+            return
+        }
         guard filteredMatches.indices.contains(row) else { return }
         selectRow(row)
         selectCurrent()
@@ -981,17 +1224,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func selectedItem() -> SearchableItem? {
         let row = tableView.selectedRow
+        if isEditingPath {
+            return pickerItems.indices.contains(row) ? pickerItems[row] : nil
+        }
         guard filteredMatches.indices.contains(row) else { return nil }
         return filteredMatches[row].item
     }
 
     private func updatePreview() {
-        guard showsPreview, let previewView, let playerView else { return }
+        guard showsPreview, !isEditingPath, let previewView, let playerView else { return }
 
         guard let item = selectedItem(), let url = item.url else {
             previewedURL = nil
             stopPlayer()
             artworkView?.isHidden = true
+            audioTitleLabel?.isHidden = true
+            audioArtistLabel?.isHidden = true
             previewView.isHidden = false
             previewView.previewItem = nil
             return
@@ -1003,13 +1251,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         previewedURL = url
 
         if isVideo(item) {
-            artworkView?.isHidden = true
             previewView.previewItem = nil
             previewView.isHidden = true
             stopPlayer()
-            playerView.frame = previewFrame
-            playerView.isHidden = false
-            loadMediaPlayer(url: url)
+            if isMatroskaVideo(item) {
+                // AVFoundation cannot decode Matroska, so show the embedded
+                // cover (or a film placeholder) instead of a blank player.
+                loadVideoCover(for: url)
+            } else {
+                artworkView?.isHidden = true
+                audioTitleLabel?.isHidden = true
+                audioArtistLabel?.isHidden = true
+                playerView.frame = previewFrame
+                playerView.isHidden = false
+                loadMediaPlayer(url: url)
+            }
         } else if isAudio(item) {
             previewView.previewItem = nil
             previewView.isHidden = true
@@ -1022,6 +1278,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             // Everything else: Finder-style Quick Look.
             stopPlayer()
             artworkView?.isHidden = true
+            audioTitleLabel?.isHidden = true
+            audioArtistLabel?.isHidden = true
             previewView.isHidden = false
             previewView.previewItem = url as NSURL
         }
@@ -1033,16 +1291,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         if config.autoplay { player.play() }
     }
 
-    /// Audio layout: cover art on top, a compact player controls strip below.
+    /// Audio layout: cover art on top, title/artist below it, and a compact
+    /// player controls strip at the bottom.
     private func layoutAudioPreview() {
         let controlsHeight: CGFloat = 64
+        let captionHeight: CGFloat = 40
         artworkView?.isHidden = false
         artworkView?.frame = NSRect(
             x: previewFrame.minX,
-            y: previewFrame.minY + controlsHeight,
+            y: previewFrame.minY + controlsHeight + captionHeight,
             width: previewFrame.width,
-            height: previewFrame.height - controlsHeight
+            height: previewFrame.height - controlsHeight - captionHeight
         )
+
+        audioTitleLabel?.isHidden = false
+        audioTitleLabel?.frame = NSRect(
+            x: previewFrame.minX + 10,
+            y: previewFrame.minY + controlsHeight + 21,
+            width: previewFrame.width - 20,
+            height: 18
+        )
+        audioArtistLabel?.isHidden = false
+        audioArtistLabel?.frame = NSRect(
+            x: previewFrame.minX + 10,
+            y: previewFrame.minY + controlsHeight + 3,
+            width: previewFrame.width - 20,
+            height: 16
+        )
+
         playerView?.frame = NSRect(
             x: previewFrame.minX,
             y: previewFrame.minY,
@@ -1051,20 +1327,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         )
     }
 
-    private func loadArtwork(for url: URL) {
+    /// Matroska cover preview: an embedded image, or a film placeholder while
+    /// it is being read / when the file has none.
+    private func loadVideoCover(for url: URL) {
         artworkToken += 1
         let token = artworkToken
 
-        // Show a music note while the (async) artwork is being extracted.
         artworkView?.contentTintColor = .tertiaryLabelColor
-        artworkView?.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 72, weight: .regular))
+        artworkView?.image = NSImage(systemSymbolName: "film", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 64, weight: .regular))
+        layoutVideoCoverPreview()
+        audioTitleLabel?.stringValue = url.lastPathComponent
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let image = Self.artworkImage(for: url)
+            let cover = MatroskaCover.read(url)
             DispatchQueue.main.async {
                 guard token == self.artworkToken else { return }
-                if let image {
+                if let cover, let image = NSImage(data: cover) {
                     self.artworkView?.contentTintColor = nil
                     self.artworkView?.image = image
                 }
@@ -1072,19 +1351,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
-    /// Extracts the embedded cover art (album artwork) from an audio file.
-    private static func artworkImage(for url: URL) -> NSImage? {
-        let asset = AVURLAsset(url: url)
-        for item in asset.commonMetadata {
-            guard item.commonKey == .commonKeyArtwork else { continue }
-            if let data = item.value as? Data, let image = NSImage(data: data) {
-                return image
-            }
-            if let data = item.dataValue, let image = NSImage(data: data) {
-                return image
+    /// Cover layout: the image fills the pane with the file name below it.
+    private func layoutVideoCoverPreview() {
+        let captionHeight: CGFloat = 40
+        artworkView?.isHidden = false
+        artworkView?.frame = NSRect(
+            x: previewFrame.minX,
+            y: previewFrame.minY + captionHeight,
+            width: previewFrame.width,
+            height: previewFrame.height - captionHeight
+        )
+        audioTitleLabel?.isHidden = false
+        audioTitleLabel?.frame = NSRect(
+            x: previewFrame.minX + 10,
+            y: previewFrame.minY + 12,
+            width: previewFrame.width - 20,
+            height: 18
+        )
+        audioArtistLabel?.isHidden = true
+    }
+
+    private func loadArtwork(for url: URL) {
+        artworkToken += 1
+        let token = artworkToken
+
+        // Show a music note while the (async) metadata is being extracted.
+        artworkView?.contentTintColor = .tertiaryLabelColor
+        artworkView?.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 72, weight: .regular))
+        audioTitleLabel?.stringValue = url.deletingPathExtension().lastPathComponent
+        audioArtistLabel?.stringValue = ""
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let metadata = Self.embeddedMetadata(for: url)
+            let image = metadata.artwork.flatMap(NSImage.init(data:))
+            DispatchQueue.main.async {
+                guard token == self.artworkToken else { return }
+                if let image {
+                    self.artworkView?.contentTintColor = nil
+                    self.artworkView?.image = image
+                }
+                if let title = metadata.title { self.audioTitleLabel?.stringValue = title }
+                if let artist = metadata.artist { self.audioArtistLabel?.stringValue = artist }
             }
         }
-        return nil
+    }
+
+    /// Tag / artwork metadata for an audio file. FLAC and Ogg are parsed by us
+    /// because AVFoundation cannot read their comments; everything else falls
+    /// back to the common metadata AVFoundation does expose.
+    private static func embeddedMetadata(for url: URL) -> AudioMetadata {
+        if let parsed = AudioMetadata.read(url), !parsed.isEmpty {
+            return parsed
+        }
+
+        var metadata = AudioMetadata()
+        for item in AVURLAsset(url: url).commonMetadata {
+            switch item.commonKey {
+            case .commonKeyTitle:
+                metadata.title = metadata.title ?? item.stringValue
+            case .commonKeyArtist:
+                metadata.artist = metadata.artist ?? item.stringValue
+            case .commonKeyAlbumName:
+                metadata.album = metadata.album ?? item.stringValue
+            case .commonKeyArtwork:
+                if metadata.artwork == nil {
+                    metadata.artwork = item.dataValue ?? item.value as? Data
+                }
+            default:
+                break
+            }
+        }
+        return metadata
     }
 
     private func stopPlayer() {
@@ -1101,6 +1439,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     private func isVideo(_ item: SearchableItem) -> Bool {
         guard !item.isDirectory, let url = item.url else { return false }
         return FileTypeRegistry.videoExts.contains(url.pathExtension.lowercased())
+    }
+
+    /// Matroska / WebM containers, whose cover image (if any) we read ourselves.
+    private func isMatroskaVideo(_ item: SearchableItem) -> Bool {
+        guard !item.isDirectory, let url = item.url else { return false }
+        return ["mkv", "webm"].contains(url.pathExtension.lowercased())
     }
 
     /// Cmd+Return: toggle whether audio/video auto-plays. The current item
@@ -1189,6 +1533,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             let isCmd = mods.contains(.command)
                 && !mods.contains(.control)
                 && !mods.contains(.option)
+
+            // Cmd+G: edit the search folder.
+            if isCmd, key == 5 {
+                self.togglePathEditing()
+                return nil
+            }
+
+            // While picking a search folder, route keys to the folder picker.
+            if self.isEditingPath {
+                // Cmd+1..9: complete the Nth folder.
+                if isCmd, !mods.contains(.shift), let index = commandDigitRowIndex(key) {
+                    self.chooseRow(index)
+                    return nil
+                }
+                switch key {
+                case 53: self.endPathEditing(); return nil              // esc
+                case 36, 76: self.commitPathEditing(); return nil       // return
+                case 48, 124: self.completePickerSelection(); return nil // tab / right
+                case 126: self.moveSelection(-1); return nil            // up
+                case 125: self.moveSelection(1); return nil             // down
+                case 116: self.moveSelectionByPage(-1); return nil      // page up
+                case 121: self.moveSelectionByPage(1); return nil       // page down
+                default: return event
+                }
+            }
+
             if isCmd {
                 // Cmd+1..9: pick the Nth row directly (like choose-gui).
                 if !mods.contains(.shift), let index = commandDigitRowIndex(key) {
@@ -1260,7 +1630,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 case 116: self.moveSelectionByPage(-1); return nil // page up
                 case 121: self.moveSelectionByPage(1); return nil  // page down
                 case 115: self.selectRow(0); return nil            // home
-                case 119: self.selectRow(self.filteredMatches.count - 1); return nil // end
+                case 119: self.selectRow(self.displayedItemCount - 1); return nil // end
                 default:
                     if self.isPrintable(event) {
                         let chars = event.characters ?? ""
@@ -1317,6 +1687,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Search field delegate
 
     func controlTextDidChange(_ obj: Notification) {
+        if let field = obj.object as? NSTextField, field === pathField {
+            updatePicker()
+            return
+        }
         applyQueryTags()
         scheduleSearch(searchField.stringValue)
     }

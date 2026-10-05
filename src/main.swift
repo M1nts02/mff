@@ -27,6 +27,8 @@ func printHelp() {
       QUERY                Anything else is used as the initial search query.
 
     OPTIONS:
+          --stdin          Force stdin mode: read items from stdin even when a
+                           path or type argument is given.
           --app            Search applications only (like Launchpad). Matches the
                            app name only (not the full path) and defaults to the
                            standard application directories; opens the selected
@@ -65,6 +67,7 @@ func printHelp() {
       ⌘1..⌘9               Select the Nth row directly
       ⌘O                    Open the selected file with its default app
       ⌘R                    Reveal the selected file in Finder
+      ⌘G                    Change the search folder (⌘1-9/Tab complete, ↩ confirm)
       ⌘T                    Open the file-type selector (file search)
       ⌘↩                    Play / toggle auto-play of audio/video previews
       Tab                  Insert a search-term separator
@@ -75,6 +78,16 @@ func printHelp() {
     BUTTONS (bottom bar):
       Open / Reveal in Finder / Return   same as ⌘O / ⌘R / ↩
       Type popup (file search)           filter results by file type
+      Folder (bottom right)              change the search folder (⌘G)
+
+    FOLDER PICKER (⌘G, file search):
+      The path field replaces the search field and the main list shows the
+      folders under the current path. The preview pane is hidden while picking.
+      ↑/↓, PgUp/PgDn       Move selection
+      Tab / → / left-click Complete (descend into) the highlighted folder
+      ⌘1..⌘9               Complete the Nth folder
+      ↩                    Confirm the current path as the search folder
+      esc                  Cancel
 
     SEARCH:
       Terms are separated by Tab (spaces are ordinary characters); every term
@@ -177,6 +190,7 @@ func standardAppPaths() -> [String] {
 func parseArguments(_ args: [String]) -> Config {
     var cfg = Config()
     var positionals: [String] = []
+    var forceStdin = false
 
     var i = 1
     while i < args.count {
@@ -202,6 +216,8 @@ func parseArguments(_ args: [String]) -> Config {
             cfg.showIcons = false
         case "--no-preview":
             cfg.noPreview = true
+        case "--stdin":
+            forceStdin = true
         case "--autoplay":
             cfg.autoplay = true
         case "--app":
@@ -268,10 +284,13 @@ func parseArguments(_ args: [String]) -> Config {
         }
     }
 
-    // Decide mode: any file directive switches us into filesystem mode.
+    // Decide mode: --stdin forces stdin; otherwise any file directive switches
+    // us into filesystem mode.
     let hasFileDirective = !cfg.searchPaths.isEmpty || !cfg.typeFilter.isEmpty
         || cfg.namePattern != nil || cfg.searchApps
-    if hasFileDirective {
+    if forceStdin {
+        cfg.mode = .stdin
+    } else if hasFileDirective {
         cfg.mode = .files
         if cfg.searchPaths.isEmpty {
             cfg.searchPaths = cfg.searchApps
