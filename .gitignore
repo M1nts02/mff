@@ -1,0 +1,5 @@
+build/
+dist/
+.xmake/
+.cache/
+*.o
