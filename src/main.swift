@@ -8,14 +8,15 @@ let kAppName = "mff"
 
 func printHelp() {
     print("""
-    \(kAppName) \(kAppVersion) – GUI fuzzy finder (Spotlight-style) for files and stdin
+    \(kAppName) \(kAppVersion) – GUI fuzzy finder (Spotlight-style) for files, apps and stdin
 
     USAGE:
       \(kAppName) [OPTIONS] [PATH|TYPE ...]
 
-    With no path/type arguments, \(kAppName) reads lines from stdin and behaves
-    like fzf. When a path or a type filter is given, it searches the filesystem
-    (like mdfind) and lets you fuzzy-search the results.
+    MODES:
+      stdin    No path/type argument: read lines from stdin (fzf-style).
+      files    A path/type/--name is given: search the filesystem (mdfind-style).
+      apps     --app: search applications by name (Launchpad-style).
 
     ARGUMENTS:
       PATH                 Existing directory to search (repeatable).
@@ -29,10 +30,10 @@ func printHelp() {
     OPTIONS:
           --stdin          Force stdin mode: read items from stdin even when a
                            path or type argument is given.
-          --app            Search applications only (like Launchpad). Matches the
-                           app name only (not the full path) and defaults to the
-                           standard application directories; opens the selected
-                           app on Enter when interactive, else prints paths.
+          --app            Use apps mode: search applications by name (like
+                           Launchpad). Matches the app name only (not the full
+                           path); opens the selected app on Enter when
+                           interactive, else prints paths.
           --autoplay       Auto-play audio/video in the preview pane when
                            selected (default: off; press Cmd+Enter to toggle).
           --enter ACTION   Enter-key behaviour in file/app search:
@@ -41,6 +42,11 @@ func printHelp() {
                              reveal  reveal the selected file in Finder
                            Items without a path (stdin) always print.
           --open           Shorthand for --enter open.
+          --multi          Allow selecting multiple items (not with --app).
+                           Shift+↑/↓ extends the selection (Finder-style);
+                           ⌘M marks a file, ⌘⇧M clears marks, ⌘⇧A marks all.
+                           Enter/Open act on every selected item; Reveal in
+                           Finder is disabled while multiple items are selected.
       -p, --path DIR       Search directory (same as PATH argument, repeatable).
           --onlyin DIR     Alias for --path (mdfind compatible).
       -t, --type TYPE      File type filter (repeatable). See TYPE above.
@@ -61,12 +67,16 @@ func printHelp() {
 
     KEYBOARD:
       ↑/↓, Ctrl+P/N/J/K    Move selection
+      ⇧↑/⇧↓               Extend the selection (multi-select, Finder-style)
+      ⌘M                    Mark/unmark the current file (multi-select)
+      ⌘⇧M                  Clear all marks (multi-select)
+      ⌘⇧A                  Mark all rows (multi-select)
       PgUp/PgDn            Move selection by a page
       Ctrl+U/Ctrl+D        Move selection by a half page
       Home/End             First / last item (list focused)
       ⌘1..⌘9               Select the Nth row directly
-      ⌘O                    Open the selected file with its default app
-      ⌘R                    Reveal the selected file in Finder
+      ⌘O                    Open the selected file(s) with their default apps
+      ⌘R                    Reveal the selected file in Finder (single selection only)
       ⌘G                    Change the search folder (⌘1-9/Tab complete, ↩ confirm)
       ⌘T                    Open the file-type selector (file search)
       ⌘↩                    Play / toggle auto-play of audio/video previews
@@ -76,9 +86,16 @@ func printHelp() {
       ctrl+c               Cancel
 
     BUTTONS (bottom bar):
+      Mark / Clear Marks (multi)         same as ⌘M / ⌘⇧M
       Open / Reveal in Finder / Return   same as ⌘O / ⌘R / ↩
       Type popup (file search)           filter results by file type
       Folder (bottom right)              change the search folder (⌘G)
+
+    DRAG & DROP (file search):
+      Drag a result out to a Finder folder to move/copy it, or onto an app
+      (e.g. the Dock) to open it. When several files are marked, dragging one
+      marked row drags them all. Finder shows the usual duplicate-name dialog
+      (keep both / replace / stop). The app exits after the drag.
 
     FOLDER PICKER (⌘G, file search):
       The path field replaces the search field and the main list shows the
@@ -167,30 +184,11 @@ func parseEnterAction(_ raw: String) -> Config.EnterAction? {
     }
 }
 
-func isDirectory(_ path: String) -> Bool {
-    var isDir: ObjCBool = false
-    return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
-}
-
-/// Standard locations Launchpad-like tools search for applications.
-func standardAppPaths() -> [String] {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    // Note: Utilities subfolders are covered by the recursive scan of their
-    // parents, so we deliberately do not list them separately (avoids dupes).
-    let candidates = [
-        "/Applications",
-        "/System/Applications",
-        "/System/Library/CoreServices/Applications",
-        home + "/Applications"
-    ]
-    let existing = candidates.filter { isDirectory($0) }
-    return existing.isEmpty ? ["/Applications"] : existing
-}
-
 func parseArguments(_ args: [String]) -> Config {
     var cfg = Config()
     var positionals: [String] = []
     var forceStdin = false
+    var searchApps = false
 
     var i = 1
     while i < args.count {
@@ -221,8 +219,7 @@ func parseArguments(_ args: [String]) -> Config {
         case "--autoplay":
             cfg.autoplay = true
         case "--app":
-            cfg.searchApps = true
-            cfg.typeFilter.categories.insert(.app)
+            searchApps = true
         case "--enter":
             i += 1
             if i < args.count {
@@ -236,6 +233,8 @@ func parseArguments(_ args: [String]) -> Config {
         case "--open":
             cfg.enterAction = .open
             cfg.enterActionExplicit = true
+        case "--multi":
+            cfg.multi = true
         case "-n":
             i += 1
             if i < args.count { cfg.numRows = Int(args[i]) ?? cfg.numRows }
@@ -284,18 +283,18 @@ func parseArguments(_ args: [String]) -> Config {
         }
     }
 
-    // Decide mode: --stdin forces stdin; otherwise any file directive switches
-    // us into filesystem mode.
+    // Decide mode: --stdin forces stdin; --app always selects app search;
+    // otherwise any file directive selects a filesystem search.
     let hasFileDirective = !cfg.searchPaths.isEmpty || !cfg.typeFilter.isEmpty
-        || cfg.namePattern != nil || cfg.searchApps
+        || cfg.namePattern != nil
     if forceStdin {
         cfg.mode = .stdin
+    } else if searchApps {
+        cfg.mode = .apps
     } else if hasFileDirective {
         cfg.mode = .files
         if cfg.searchPaths.isEmpty {
-            cfg.searchPaths = cfg.searchApps
-                ? standardAppPaths()
-                : [FileManager.default.currentDirectoryPath]
+            cfg.searchPaths = [FileManager.default.currentDirectoryPath]
         }
     } else {
         cfg.mode = .stdin
@@ -304,8 +303,15 @@ func parseArguments(_ args: [String]) -> Config {
     // Launchpad behaviour: open the app on Enter when interactive. Keep plain
     // path output when stdout is redirected so the tool stays pipeable. An
     // explicit --enter / --open always wins.
-    if cfg.searchApps && !cfg.enterActionExplicit && isatty(STDOUT_FILENO) != 0 {
+    if searchApps && !cfg.enterActionExplicit && isatty(STDOUT_FILENO) != 0 {
         cfg.enterAction = .open
+    }
+
+    // Multi-select is a file/stdin concept; app search is a single-action
+    // launcher, so --multi does not apply there.
+    if cfg.multi && searchApps {
+        fputs("\(kAppName): --multi is not supported with --app; ignoring --multi\n", stderr)
+        cfg.multi = false
     }
 
     return cfg

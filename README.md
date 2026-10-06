@@ -3,14 +3,24 @@
 A native macOS GUI fuzzy finder with a Spotlight-style interface and fzf-style
 behaviour. Built with Swift and xmake.
 
-- No arguments: read lines from stdin and fuzzy-select one, like fzf. `--stdin`
-  forces stdin mode even when a path/type argument is given.
-- With a path / file type: search the filesystem; arguments follow `mdfind`.
-  `⌘G` changes the search folder with path completion.
-- Embedded preview: Quick Look for documents / images / folders, a player with
-  cover art for audio / video. FLAC/OGG/Opus tags and MKV/WebM cover art are
-  read natively.
-- `--app`: search applications, like Launchpad.
+## Modes
+
+- **stdin** — no path/type argument (or `--stdin`): read lines from stdin,
+  fzf-style.
+- **files** — a path / type / `--name` is given: search the filesystem
+  (mdfind-style). `⌘G` changes the search folder with path completion.
+- **apps** — `--app`: search applications by name (Launchpad-style); launches on
+  Enter when interactive.
+
+## Features
+
+- Embedded preview (file mode): Quick Look for documents / images / folders, a
+  player with cover art for audio / video. FLAC/OGG/Opus tags and MKV/WebM
+  cover art are read natively.
+- Drag & drop (file mode): drag a result out to a Finder folder to move/copy
+  it, or onto an app (e.g. the Dock) to open it. When several files are marked,
+  dragging one marked row drags them all. Finder handles duplicate-name
+  conflicts (keep both / replace / stop). The app exits after the drag.
 
 ## Usage
 
@@ -75,6 +85,7 @@ ordinary characters. Every term must match (AND) somewhere in the **whole path**
 | `--stdin` | Force stdin mode: read items from stdin even when a path/type argument is given |
 | `-q, --query TEXT` | Initial query |
 | `--enter path\|open\|reveal` | Enter action (default `path`); `--open` = `--enter open` |
+| `--multi` | Allow multi-select (not with `--app`); `⇧↑/↓` extends, `⌘M` marks, `⌘⇧M` clears marks, `⌘⇧A` marks all |
 | `--autoplay` | Auto-play audio/video previews (default off; `⌘↩` toggles) |
 | `--no-preview` / `--no-icons` | Disable the preview pane / file icons |
 | `--hidden` | Include hidden files (default: skip) |
@@ -90,7 +101,11 @@ ordinary characters. Every term must match (AND) somewhere in the **whole path**
 | `⌘↩` | Play / toggle auto-play of audio/video previews |
 | `Tab` | Insert a search-term separator |
 | `↩` | Return the selected path |
-| `⌘O` / `⌘R` | Open / reveal in Finder |
+| `⌘O` / `⌘R` | Open / reveal in Finder (reveal disabled while multi-selected) |
+| `⇧↑/↓` | Extend the selection (Finder-style, `--multi`) |
+| `⌘M` | Mark/unmark the current file (`--multi`) |
+| `⌘⇧M` | Clear all marks (`--multi`) |
+| `⌘⇧A` | Mark all rows (`--multi`) |
 | `⌘G` | Change the search folder (⌘1-9/Tab complete, `↩` confirm) |
 | `⌘T` | Open the file-type selector (file search) |
 | `⌘1`–`⌘9` | Select the Nth row (rows 1–9 show their number) |
@@ -102,7 +117,8 @@ completes (descends into) the highlighted folder, `⌘1`–`⌘9` completes the 
 
 ### Bottom bar
 
-- Left: `Open` / `Reveal in Finder` / `Return` (same as `⌘O` / `⌘R` / `↩`).
+- Left: `Mark` / `Clear Marks` (multi-select, same as `⌘M` / `⌘⇧M`), then
+  `Open` / `Reveal in Finder` / `Return` (same as `⌘O` / `⌘R` / `↩`).
 - Right: `⌘G` folder picker (change the search folder; the list goes full width
   and the preview is hidden while picking) and, for file search, the file-type
   popup (same as `⌘T`).

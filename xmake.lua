@@ -1,5 +1,5 @@
 set_project("mff")
-set_version("0.0.2")
+set_version("0.0.3")
 set_xmakever("2.8.0")
 
 add_rules("mode.debug", "mode.release")

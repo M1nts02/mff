@@ -15,19 +15,20 @@ struct Config {
     var outputIndex = false
     var autoSelectSingle = false
     var returnQueryOnMismatch = false
+    var multi = false
     var numRows = 10
     var windowWidth: CGFloat = 720
     var showIcons = true
     var includeHidden = false
     var noPreview = false
     var autoplay = false
-    var searchApps = false
     var enterAction: EnterAction = .printPath
     var enterActionExplicit = false
 
     enum Mode {
         case stdin
         case files
+        case apps
     }
 
     /// What the Enter key does in file / app search.
@@ -55,6 +56,13 @@ final class ResultTableView: NSTableView {
 
 final class SpotlightRowView: NSTableRowView {
     private var isHovered = false
+    /// Secondary Finder-style multi-selection (the accent highlight is reserved
+    /// for the active row).
+    var isMultiSelected = false {
+        didSet {
+            if isMultiSelected != oldValue { needsDisplay = true }
+        }
+    }
 
     override func drawSelection(in dirtyRect: NSRect) {
         if selectionHighlightStyle != .none {
@@ -67,6 +75,12 @@ final class SpotlightRowView: NSTableRowView {
 
     override func drawBackground(in dirtyRect: NSRect) {
         super.drawBackground(in: dirtyRect)
+        if isMultiSelected && !isSelected {
+            let rect = bounds.insetBy(dx: 6, dy: 3)
+            let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+            NSColor.controlAccentColor.withAlphaComponent(0.22).setFill()
+            path.fill()
+        }
         if isHovered && !isSelected {
             let rect = bounds.insetBy(dx: 6, dy: 3)
             let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
@@ -134,7 +148,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // Data
     private var allItems: [SearchableItem] = []
     private var filteredMatches: [MatchResult] = []
+
+    // Multi-selection (Finder-style shift+arrows / Cmd+A). Indices are rows in
+    // the currently displayed list; the table's own selection is the active row.
+    private var multiSelection: Set<Int> = []
+    private var selectionAnchor: Int?
+    private var revealButton: NSButton?
+    private var clearMarksButton: NSButton?
     private var isStreaming = false
+    private var isDragging = false
     private var loadGeneration = 0
     private var searchGeneration = 0
     private var searchTimer: Timer?
@@ -172,9 +194,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ("Folders", .folder)
     ]
 
+    private var isFileSearch: Bool { config.mode == .files }
+    private var isAppSearch: Bool { config.mode == .apps }
+    private var isStdin: Bool { config.mode == .stdin }
+
     private var showsPreview: Bool {
         // App search is a compact launcher; it does not need a preview pane.
-        return config.mode == .files && !config.noPreview && !config.searchApps
+        return isFileSearch && !config.noPreview
+    }
+
+    /// Multi-select is available everywhere except app search.
+    private var multiSelectEnabled: Bool {
+        config.multi && !isAppSearch
+    }
+
+    /// True once more than one row is part of the selection. Finder-style
+    /// reveal-in-Finder does not make sense for a multi-selection, so it is
+    /// disabled in that state.
+    private var hasMultiSelection: Bool {
+        multiSelectEnabled && multiSelection.count > 1
     }
 
     init(config: Config) {
@@ -210,10 +248,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         startLoadingData()
         updateFooter()
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        // nothing to clean up
     }
 
     /// Invisible menu bar so Cmd+C/X/V/A/Z work inside the search field.
@@ -322,7 +356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchField.drawsBackground = false
         searchField.isBezeled = false
         searchField.isBordered = false
-        searchField.placeholderString = config.mode == .files ? "Search files" : "Search"
+        searchField.placeholderString = isFileSearch ? "Search files"
+            : (isAppSearch ? "Search apps" : "Search")
         searchField.autoresizingMask = [.width]
 
         if let cell = searchField.cell as? NSSearchFieldCell {
@@ -365,6 +400,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         tableView.target = self
         tableView.action = #selector(handleClick)
         tableView.doubleAction = #selector(handleClick)
+        // File search supports dragging results out to Finder (move/copy) or
+        // onto an app (open); Finder handles move/copy conflict dialogs.
+        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: false)
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("ItemColumn"))
         column.width = width
@@ -458,11 +496,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         // Left: action buttons.
         var buttons: [NSButton] = []
-        if config.mode == .files {
+        if multiSelectEnabled {
+            buttons.append(makeFooterButton("Mark", #selector(footerMark)))
+            let clearMarks = makeFooterButton("Clear Marks", #selector(footerClearMarks))
+            clearMarksButton = clearMarks
+            buttons.append(clearMarks)
+        }
+        if !isStdin {
             buttons.append(makeFooterButton("Open", #selector(footerOpen)))
-            buttons.append(makeFooterButton("Reveal in Finder", #selector(footerReveal)))
+            let reveal = makeFooterButton("Reveal in Finder", #selector(footerReveal))
+            revealButton = reveal
+            buttons.append(reveal)
         }
         buttons.append(makeFooterButton("Return", #selector(footerReturn)))
+        updateRevealButton()
+        updateClearMarksButton()
 
         let stack = NSStackView(views: buttons)
         stack.orientation = .horizontal
@@ -489,7 +537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ])
 
         // Right (file search only): folder picker, plus type filter.
-        if config.mode == .files && !config.searchApps {
+        if isFileSearch {
             let folderButton = NSButton(
                 image: NSImage(systemSymbolName: "folder", accessibilityDescription: "Search folder") ?? NSImage(),
                 target: self,
@@ -527,6 +575,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    /// Disables "Reveal in Finder" while several items are selected, since a
+    /// Finder reveal only makes sense for a single selection.
+    private func updateRevealButton() {
+        revealButton?.isEnabled = !hasMultiSelection
+    }
+
+    /// "Clear all marks" is only actionable when something is marked.
+    private func updateClearMarksButton() {
+        clearMarksButton?.isEnabled = multiSelectEnabled && !multiSelection.isEmpty
+    }
+
     private func makeFooterButton(_ title: String, _ action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
@@ -541,6 +600,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         return config.typeFilter.categories.first
     }
 
+    @objc private func footerMark() {
+        guard !isEditingPath else { return }
+        toggleSelection(at: tableView.selectedRow)
+    }
+
+    @objc private func footerClearMarks() {
+        guard !isEditingPath else { return }
+        clearAllMarks()
+    }
+
     @objc private func footerOpen() {
         guard !isEditingPath else { return }
         config.enterAction = .open
@@ -549,6 +618,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     @objc private func footerReveal() {
         guard !isEditingPath else { return }
+        guard !hasMultiSelection else { return }
         config.enterAction = .reveal
         selectCurrent()
     }
@@ -568,15 +638,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         config.typeFilter = category.map { TypeFilter(extensions: [], categories: [$0]) } ?? TypeFilter()
         allItems.removeAll()
         filteredMatches.removeAll()
+        clearSelection()
         tableView.reloadData()
         updateFooter()
-        loadFiles()
+        startLoadingData()
     }
 
     // MARK: - Search-folder editor
 
     private func setupPathEditor() {
-        guard config.mode == .files, !config.searchApps, let container = window.contentView else { return }
+        guard isFileSearch, let container = window.contentView else { return }
 
         let icon = NSImageView(frame: searchIcon?.frame ?? .zero)
         icon.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Folder")?
@@ -602,11 +673,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func beginPathEditing() {
-        guard config.mode == .files, !config.searchApps, !isEditingPath,
+        guard isFileSearch, !isEditingPath,
               let pathField, let pathIcon else { return }
         isEditingPath = true
         pickerPaths.removeAll()
         pickerItems.removeAll()
+        clearSelection()
 
         let seed = config.searchPaths.first ?? FileManager.default.currentDirectoryPath
         pathField.stringValue = seed
@@ -673,7 +745,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         previewedURL = nil
 
         endPathEditing()
-        loadFiles()
+        startLoadingData()
         updateFooter()
     }
 
@@ -711,73 +783,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Input loading
 
     private func startLoadingData() {
+        let source: ItemSource
         switch config.mode {
         case .stdin:
-            loadStdin()
+            source = StdinSource()
         case .files:
-            loadFiles()
+            source = FileSource(
+                paths: config.searchPaths,
+                typeFilter: config.typeFilter,
+                namePattern: config.namePattern,
+                includeHidden: config.includeHidden
+            )
+        case .apps:
+            source = AppSource()
         }
-    }
 
-    private func loadStdin() {
-        if isatty(FileHandle.standardInput.fileDescriptor) != 0 {
-            fputs("mff: no input. Pipe items on stdin, or pass a path/type to search files.\n", stderr)
-            exit(1)
-        }
-        isStreaming = true
-        updateFooter()
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let handle = FileHandle.standardInput
-            let chunkSize = 64 * 1024
-            var pending = ""
-            var batch: [String] = []
-            batch.reserveCapacity(512)
-
-            while true {
-                let data = handle.readData(ofLength: chunkSize)
-                if data.isEmpty { break }
-                var text = pending + (String(data: data, encoding: .utf8) ?? "")
-                pending = ""
-
-                while let range = text.range(of: "\n") {
-                    let line = String(text[..<range.lowerBound])
-                    text = String(text[range.upperBound...])
-                    if !line.isEmpty {
-                        batch.append(line)
-                        if batch.count >= 512 {
-                            let chunk = batch
-                            batch.removeAll(keepingCapacity: true)
-                            let items = chunk.map { SearchableItem(text: $0) }
-                            DispatchQueue.main.async { self.appendItems(items) }
-                        }
-                    }
-                }
-                pending = text
-            }
-
-            if !pending.isEmpty { batch.append(pending) }
-            if !batch.isEmpty {
-                let chunk = batch
-                let items = chunk.map { SearchableItem(text: $0) }
-                DispatchQueue.main.async { self.appendItems(items) }
-            }
-
-            DispatchQueue.main.async { self.finishStreaming() }
-        }
-    }
-
-    private func loadFiles() {
         loadGeneration += 1
         let generation = loadGeneration
         isStreaming = true
         updateFooter()
 
-        FileIndexer.enumerate(
-            paths: config.searchPaths,
-            typeFilter: config.typeFilter,
-            namePattern: config.namePattern,
-            includeHidden: config.includeHidden,
+        source.load(
             onBatch: { [weak self] batch in
                 guard let self, generation == self.loadGeneration else { return }
                 self.appendItems(batch)
@@ -838,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let items = allItems
         // App search matches only the app name; everything else matches the
         // whole path.
-        let matchPath = !config.searchApps
+        let matchPath = !isAppSearch
 
         DispatchQueue.global(qos: .userInitiated).async {
             var results: [MatchResult]
@@ -863,6 +889,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 self.tableView.reloadData()
                 if !results.isEmpty {
                     self.selectRow(0)
+                } else {
+                    self.clearSelection()
                 }
                 self.updateFooter()
 
@@ -887,10 +915,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         var text: String
         if isStreaming {
             text = "Searching… \(total) found"
-        } else if config.mode == .files {
-            text = "\(total) files"
         } else {
-            text = "\(total) lines"
+            switch config.mode {
+            case .files: text = "\(total) files"
+            case .apps: text = "\(total) apps"
+            case .stdin: text = "\(total) lines"
+            }
         }
 
         if !searchField.stringValue.isEmpty {
@@ -913,7 +943,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-        return SpotlightRowView()
+        let rowView = SpotlightRowView()
+        rowView.isMultiSelected = multiSelectEnabled && multiSelection.contains(row)
+        return rowView
+    }
+
+    // MARK: Drag out (file search only)
+
+    /// Enables dragging a search result out to Finder (move/copy) or onto an
+    /// app (open). Only file search rows have a URL, so stdin/app rows and the
+    /// folder picker are automatically non-draggable.
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard isFileSearch, !isEditingPath else { return nil }
+        guard filteredMatches.indices.contains(row) else { return nil }
+        guard let url = filteredMatches[row].item.url else { return nil }
+        return url as NSURL
+    }
+
+    /// When the grabbed row is part of a multi-mark selection, drag every
+    /// marked file together so Finder can move/copy them as a group and show
+    /// the usual duplicate-name conflict dialog (keep both / replace / stop).
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        isDragging = true
+        guard isFileSearch, !isEditingPath, multiSelection.count > 1 else { return }
+        guard !rowIndexes.intersection(IndexSet(multiSelection)).isEmpty else { return }
+
+        let urls = multiSelection.sorted().compactMap { itemForRow($0)?.url }
+        guard urls.count > 1 else { return }
+
+        let pasteboard = session.draggingPasteboard
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls.map { $0 as NSURL })
+    }
+
+    /// Dragging a result out is a one-shot action: after the drag finishes
+    /// there is no returned selection, so exit like Esc. The exit is deferred to
+    /// the next runloop turn so AppKit/Finder can finish winding down the drag
+    /// session first; terminating synchronously here can leave the destination
+    /// window in a broken state (especially for multi-file moves).
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        isDragging = false
+        DispatchQueue.main.async {
+            NSApp.terminate(nil)
+        }
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -987,7 +1059,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
         nameField.centerYAnchor.constraint(equalTo: cell.centerYAnchor).isActive = true
 
-        if !config.searchApps && !item.parentPath.isEmpty {
+        if !isAppSearch && !item.parentPath.isEmpty {
             let pathField = NSTextField(labelWithString: "")
             pathField.translatesAutoresizingMaskIntoConstraints = false
             pathField.font = NSFont.systemFont(ofSize: 11, weight: .regular)
@@ -1030,7 +1102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// Highlight indices (per search term) into the item's file name.
     private func nameHighlightPositions(for item: SearchableItem, match: MatchResult) -> [[Int]] {
         let nameLen = item.displayName.count
-        let nameStart = config.searchApps
+        let nameStart = isAppSearch
             ? 0
             : max(0, item.lowerSearch.count - item.lowerDisplay.count)
         return match.termPositions.map { term in
@@ -1043,7 +1115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     /// Highlight indices (per search term) into the item's parent directory.
     private func pathHighlightPositions(for item: SearchableItem, match: MatchResult) -> [[Int]] {
-        guard !config.searchApps else { return [] }
+        guard !isAppSearch else { return [] }
         let parentLen = item.parentPath.count
         return match.termPositions.map { term in
             term.filter { $0 >= 0 && $0 < parentLen }
@@ -1082,29 +1154,117 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         isEditingPath ? pickerItems.count : filteredMatches.count
     }
 
+    /// Selects a single row, clearing any marks (fresh selection).
     private func selectRow(_ index: Int) {
+        guard index >= 0, index < displayedItemCount else { return }
+        multiSelection.removeAll()
+        selectionAnchor = index
+        applyTableSelection(index)
+    }
+
+    /// Moves the active (cursor) row without disturbing marked rows, so ⌘M
+    /// marks persist while navigating with the arrow keys.
+    private func moveCursor(to index: Int) {
+        guard index >= 0, index < displayedItemCount else { return }
+        selectionAnchor = index
+        applyTableSelection(index)
+    }
+
+    /// Applies the active (accent-highlighted) row and keeps the secondary
+    /// multi-selection highlight in sync.
+    private func applyTableSelection(_ index: Int) {
         guard index >= 0, index < displayedItemCount else { return }
         tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         tableView.scrollRowToVisible(index)
         updatePreview()
+        updateRevealButton()
+        updateClearMarksButton()
+        refreshRowSelectionDisplay()
     }
 
-    private func moveSelection(_ offset: Int) {
+    /// Finder-style range extension: selection becomes the contiguous range from
+    /// the anchor to `index`, and `index` becomes the active row.
+    private func extendSelection(to index: Int) {
+        let count = displayedItemCount
+        guard count > 0, index >= 0, index < count else { return }
+        let anchor = max(selectionAnchor ?? tableView.selectedRow, 0)
+        let lower = min(anchor, index)
+        let upper = max(anchor, index)
+        multiSelection = Set(lower...upper)
+        selectionAnchor = anchor
+        applyTableSelection(index)
+    }
+
+    /// Cmd+click / Cmd+M: toggles an individual row's mark in the selection.
+    private func toggleSelection(at index: Int) {
+        guard multiSelectEnabled, index >= 0, index < displayedItemCount else { return }
+        if multiSelection.contains(index) {
+            multiSelection.remove(index)
+        } else {
+            multiSelection.insert(index)
+        }
+        selectionAnchor = index
+        applyTableSelection(index)
+    }
+
+    /// Cmd+Shift+M: clear every mark, falling back to the active row.
+    private func clearAllMarks() {
+        guard multiSelectEnabled else { return }
+        multiSelection.removeAll()
+        selectionAnchor = tableView.selectedRow >= 0 ? tableView.selectedRow : nil
+        updateRevealButton()
+        updateClearMarksButton()
+        refreshRowSelectionDisplay()
+    }
+
+    /// Cmd+Shift+A: mark every row in the current list (the active row is kept
+    /// in place). Cmd+A alone stays bound to the search field's "select all text".
+    private func markAllRows() {
+        guard multiSelectEnabled else { return }
+        let count = displayedItemCount
+        guard count > 0 else { return }
+        multiSelection = Set(0..<count)
+        selectionAnchor = tableView.selectedRow >= 0 ? tableView.selectedRow : 0
+        updateRevealButton()
+        updateClearMarksButton()
+        refreshRowSelectionDisplay()
+    }
+
+    private func clearSelection() {
+        multiSelection.removeAll()
+        selectionAnchor = nil
+        tableView.deselectAll(nil)
+        updateRevealButton()
+        updateClearMarksButton()
+    }
+
+    private func refreshRowSelectionDisplay() {
+        tableView.enumerateAvailableRowViews { view, row in
+            (view as? SpotlightRowView)?.isMultiSelected =
+                self.multiSelectEnabled && self.multiSelection.contains(row)
+        }
+    }
+
+    private func moveSelection(_ offset: Int, extend: Bool = false) {
         let count = displayedItemCount
         guard count > 0 else { return }
         let current = tableView.selectedRow
         var next = current + offset
         if next < 0 { next = 0 }
         if next >= count { next = count - 1 }
-        selectRow(next)
+        if extend && multiSelectEnabled {
+            extendSelection(to: next)
+        } else {
+            moveCursor(to: next)
+        }
     }
 
-    private func moveSelectionByPage(_ direction: Int) {
-        moveSelection(direction * max(1, config.numRows))
+    private func moveSelectionByPage(_ direction: Int, extend: Bool = false) {
+        moveSelection(direction * max(1, config.numRows), extend: extend)
     }
 
-    private func moveSelectionByHalfPage(_ direction: Int) {
-        moveSelection(direction * max(1, config.numRows / 2))
+    private func moveSelectionByHalfPage(_ direction: Int, extend: Bool = false) {
+        moveSelection(direction * max(1, config.numRows / 2), extend: extend)
     }
 
     private func chooseRow(_ index: Int) {
@@ -1129,14 +1289,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         guard filteredMatches.indices.contains(row) else { return }
+
+        if multiSelectEnabled {
+            let event = NSApp.currentEvent
+            let mods = event?.modifierFlags ?? []
+            let clickCount = event?.clickCount ?? 1
+            if mods.contains(.command) {
+                toggleSelection(at: row)
+                return
+            }
+            if mods.contains(.shift) {
+                extendSelection(to: row)
+                return
+            }
+            if clickCount >= 2 {
+                selectRow(row)
+                selectCurrent()
+                return
+            }
+            // A plain click only moves the active row; it does not accept.
+            selectRow(row)
+            return
+        }
+
         selectRow(row)
         selectCurrent()
     }
 
-    private func currentMatch() -> MatchResult? {
+    private func itemForRow(_ row: Int) -> SearchableItem? {
+        if isEditingPath {
+            return pickerItems.indices.contains(row) ? pickerItems[row] : nil
+        }
+        return filteredMatches.indices.contains(row) ? filteredMatches[row].item : nil
+    }
+
+    /// Rows to act on: every marked row when any exist, otherwise the
+    /// active (cursor) row.
+    private func selectedRows() -> [Int] {
+        if !multiSelection.isEmpty {
+            return multiSelection.sorted()
+        }
         let row = tableView.selectedRow
-        guard filteredMatches.indices.contains(row) else { return nil }
-        return filteredMatches[row]
+        return (row >= 0 && row < displayedItemCount) ? [row] : []
     }
 
     private func emit(_ item: SearchableItem) {
@@ -1144,6 +1338,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             writeOutput(String(item.id))
         } else {
             writeOutput(item.raw)
+        }
+    }
+
+    /// Opens every selected item with its own default application, so a mix of
+    /// file types opens correctly (images in Preview, audio in Music, etc.).
+    private func openItems(_ items: [SearchableItem]) {
+        for item in items {
+            if let url = item.url {
+                NSWorkspace.shared.open(url)
+            } else {
+                emit(item)
+            }
+        }
+    }
+
+    /// Accepts a multi-selection: opens all files for `--enter open`/Open, and
+    /// otherwise prints every selected item (newline- or NUL-separated).
+    /// Reveal-in-Finder is intentionally not offered for multi-selections.
+    private func acceptMultiple(_ items: [SearchableItem]) {
+        guard !items.isEmpty else {
+            if config.returnQueryOnMismatch {
+                writeOutput(searchField.stringValue)
+                exit(0)
+            }
+            exit(1)
+        }
+        if config.enterAction == .open {
+            openItems(items)
+        } else {
+            for item in items { emit(item) }
         }
     }
 
@@ -1166,21 +1390,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     private func selectCurrent() {
-        guard let match = currentMatch() else {
+        let items = selectedRows().compactMap { itemForRow($0) }
+        guard !items.isEmpty else {
             if config.returnQueryOnMismatch {
                 writeOutput(searchField.stringValue)
                 exit(0)
             }
             exit(1)
         }
-        performEnter(on: match.item)
+        if items.count > 1 {
+            acceptMultiple(items)
+        } else {
+            performEnter(on: items[0])
+        }
         exit(0)
     }
 
-    /// Cmd+O: open the selected file with its default application.
+    /// Cmd+O: open the selected file(s) with their default applications.
     private func openSelectedFile() {
-        guard let match = currentMatch(), let url = match.item.url else { return }
-        NSWorkspace.shared.open(url)
+        let urls = selectedRows().compactMap { itemForRow($0) }.compactMap { $0.url }
+        guard !urls.isEmpty else { return }
+        for url in urls { NSWorkspace.shared.open(url) }
         exit(0)
     }
 
@@ -1189,9 +1419,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         typePopup?.performClick(nil)
     }
 
-    /// Cmd+R: reveal the selected file in Finder.
+    /// Cmd+R: reveal the selected file in Finder. Not offered while several
+    /// items are selected (the footer button is disabled in that state).
     private func revealSelectedFile() {
-        guard let match = currentMatch(), let url = match.item.url else { return }
+        guard !hasMultiSelection else {
+            NSSound.beep()
+            return
+        }
+        guard let item = selectedRows().compactMap({ itemForRow($0) }).first,
+              let url = item.url else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
         exit(0)
     }
@@ -1575,6 +1811,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     self.revealSelectedFile()
                     return nil
                 }
+                // Cmd+M: mark/unmark the current file (multi-select).
+                if !mods.contains(.shift), key == 46 {
+                    self.toggleSelection(at: self.tableView.selectedRow)
+                    return nil
+                }
+                // Cmd+Shift+M: clear every mark.
+                if mods.contains(.shift), key == 46 {
+                    self.clearAllMarks()
+                    return nil
+                }
+                // Cmd+Shift+A: mark every row (multi-select). Works regardless
+                // of whether the search field or the list has focus.
+                if mods.contains(.shift), key == 0 {
+                    self.markAllRows()
+                    return nil
+                }
                 // Cmd+T: open the file-type selector (bottom-right).
                 if !mods.contains(.shift), key == 17 {
                     self.openTypePopup()
@@ -1591,10 +1843,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
             if searchIsFirst {
                 switch key {
-                case 126: self.moveSelection(-1); return nil
-                case 125: self.moveSelection(1); return nil
-                case 116: self.moveSelectionByPage(-1); return nil // page up
-                case 121: self.moveSelectionByPage(1); return nil  // page down
+                case 126: self.moveSelection(-1, extend: mods.contains(.shift)); return nil
+                case 125: self.moveSelection(1, extend: mods.contains(.shift)); return nil
+                case 116: self.moveSelectionByPage(-1, extend: mods.contains(.shift)); return nil // page up
+                case 121: self.moveSelectionByPage(1, extend: mods.contains(.shift)); return nil  // page down
                 case 36, 76: self.selectCurrent(); return nil
                 case 53:
                     if !self.searchField.stringValue.isEmpty {
@@ -1611,10 +1863,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     return nil
                 default:
                     if mods.contains(.control) {
-                        if key == 35 || key == 40 { self.moveSelection(-1); return nil }
-                        if key == 45 || key == 38 { self.moveSelection(1); return nil }
-                        if key == 32 { self.moveSelectionByHalfPage(-1); return nil } // ctrl+u
-                        if key == 2 { self.moveSelectionByHalfPage(1); return nil }   // ctrl+d
+                        if key == 35 || key == 40 { self.moveSelection(-1, extend: mods.contains(.shift)); return nil }
+                        if key == 45 || key == 38 { self.moveSelection(1, extend: mods.contains(.shift)); return nil }
+                        if key == 32 { self.moveSelectionByHalfPage(-1, extend: mods.contains(.shift)); return nil } // ctrl+u
+                        if key == 2 { self.moveSelectionByHalfPage(1, extend: mods.contains(.shift)); return nil }   // ctrl+d
                         if key == 8 { self.cancel(); return nil } // ctrl+c
                     }
                     return event
@@ -1625,10 +1877,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 case 53: self.cancel(); return nil
                 case 36, 76: self.selectCurrent(); return nil
                 case 48: self.insertQuerySeparator(); return nil // tab -> separator
-                case 123, 124, 125, 126, 117:
-                    return event // arrows / forward-delete handled natively by the table
-                case 116: self.moveSelectionByPage(-1); return nil // page up
-                case 121: self.moveSelectionByPage(1); return nil  // page down
+                case 125: // down
+                    self.moveSelection(1, extend: mods.contains(.shift)); return nil
+                case 126: // up
+                    self.moveSelection(-1, extend: mods.contains(.shift)); return nil
+                case 123, 124, 117:
+                    return event // left / right / forward-delete handled natively by the table
+                case 116: self.moveSelectionByPage(-1, extend: mods.contains(.shift)); return nil // page up
+                case 121: self.moveSelectionByPage(1, extend: mods.contains(.shift)); return nil  // page down
                 case 115: self.selectRow(0); return nil            // home
                 case 119: self.selectRow(self.displayedItemCount - 1); return nil // end
                 default:
@@ -1661,7 +1917,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
 
     private func installClickMonitor() {
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            guard let self else { return }
+            guard let self, !self.isDragging else { return }
             let point = NSEvent.mouseLocation
             if self.window.frame.contains(point) { return }
             NSApp.terminate(nil)
@@ -1681,6 +1937,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc func windowDidResignKey(_ notification: Notification) {
+        // While a drag is in progress the panel naturally resigns key as the
+        // drop target (e.g. Finder) becomes active; do not terminate mid-drag.
+        guard !isDragging else { return }
         NSApp.terminate(nil)
     }
 
