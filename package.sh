@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 # Bump this to release a new version. It is injected into the binary and used
 # for the package name, so it is the single source of truth.
-VERSION="0.0.3"
+VERSION="0.0.4"
 
 APP="mff"
 PLAT="macosx"

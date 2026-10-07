@@ -8,7 +8,7 @@ let kAppName = "mff"
 
 func printHelp() {
     print("""
-    \(kAppName) \(kAppVersion) – GUI fuzzy finder (Spotlight-style) for files, apps and stdin
+    \(kAppName) \(kAppVersion) – GUI fuzzy finder (Spotlight-style) for files, file contents, apps and stdin
 
     USAGE:
       \(kAppName) [OPTIONS] [PATH|TYPE ...]
@@ -16,6 +16,8 @@ func printHelp() {
     MODES:
       stdin    No path/type argument: read lines from stdin (fzf-style).
       files    A path/type/--name is given: search the filesystem (mdfind-style).
+      content  --content: like files, but also matches text contents and audio
+               metadata (title / artist / album).
       apps     --app: search applications by name (Launchpad-style).
 
     ARGUMENTS:
@@ -23,7 +25,9 @@ func printHelp() {
                            Default: current directory (file mode).
       TYPE                 File type filter. An extension such as ".mp3", "mp3"
                            or "tar.gz", or a category such as image, video,
-                           audio, document, text, archive, folder.
+                           audio, document, text, archive, folder. The text
+                           category also covers source code, lyrics (.lrc and
+                           friends) and subtitles (.srt/.ass/.vtt/...).
                            Comma lists are allowed: image,video
       QUERY                Anything else is used as the initial search query.
 
@@ -34,9 +38,18 @@ func printHelp() {
                            Launchpad). Matches the app name only (not the full
                            path); opens the selected app on Enter when
                            interactive, else prints paths.
+          --content        Use content mode: like file search, but also match
+                           text contents and audio metadata (title / artist /
+                           album). Matching starts one second after you stop
+                           typing, then results stream in as the tree is scanned.
+          --max-filesize SIZE
+                           Content mode: do not search the contents of files
+                           larger than SIZE. SIZE takes an optional K/M/G
+                           suffix (1024-based) or plain bytes; 0 means no
+                           limit (default: 20M).
           --autoplay       Auto-play audio/video in the preview pane when
                            selected (default: off; press Cmd+Enter to toggle).
-          --enter ACTION   Enter-key behaviour in file/app search:
+          --enter ACTION   Enter-key behaviour in file/content/app search:
                              path    print the selected path (default)
                              open    open with the default application
                              reveal  reveal the selected file in Finder
@@ -54,7 +67,7 @@ func printHelp() {
       -q, --query TEXT     Initial search query.
       -n ROWS              Number of visible rows (default: 10).
       -w WIDTH             List area width in points (default: 720); the preview
-                           pane is added on the right in file mode.
+                           pane is added on the right in file/content mode.
       -0                   Print selection followed by a NUL byte.
       -1                   Auto-select if exactly one match remains.
       -i                   Print the index of the selected item instead of it.
@@ -78,7 +91,7 @@ func printHelp() {
       ⌘O                    Open the selected file(s) with their default apps
       ⌘R                    Reveal the selected file in Finder (single selection only)
       ⌘G                    Change the search folder (⌘1-9/Tab complete, ↩ confirm)
-      ⌘T                    Open the file-type selector (file search)
+      ⌘T                    Open the file-type selector (file/content search)
       ⌘↩                    Play / toggle auto-play of audio/video previews
       Tab                  Insert a search-term separator
       ↩                    Accept: print the current item
@@ -88,16 +101,16 @@ func printHelp() {
     BUTTONS (bottom bar):
       Mark / Clear Marks (multi)         same as ⌘M / ⌘⇧M
       Open / Reveal in Finder / Return   same as ⌘O / ⌘R / ↩
-      Type popup (file search)           filter results by file type
+      Type popup (file/content search)   filter results by file type
       Folder (bottom right)              change the search folder (⌘G)
 
-    DRAG & DROP (file search):
+    DRAG & DROP (file/content search):
       Drag a result out to a Finder folder to move/copy it, or onto an app
       (e.g. the Dock) to open it. When several files are marked, dragging one
       marked row drags them all. Finder shows the usual duplicate-name dialog
       (keep both / replace / stop). The app exits after the drag.
 
-    FOLDER PICKER (⌘G, file search):
+    FOLDER PICKER (⌘G, file/content search):
       The path field replaces the search field and the main list shows the
       folders under the current path. The preview pane is hidden while picking.
       ↑/↓, PgUp/PgDn       Move selection
@@ -108,7 +121,8 @@ func printHelp() {
 
     SEARCH:
       Terms are separated by Tab (spaces are ordinary characters); every term
-      must match (AND) somewhere in the full path.
+      must match (AND) somewhere in the full path (or, in content mode, in the
+      text contents of the file).
       Each term is shown as its own coloured tag in the query field, and its
       matches are highlighted in the same colour in the results.
         text        fuzzy match (letters in order, anywhere in the path)
@@ -117,6 +131,10 @@ func printHelp() {
         ^text       file name starts with text
         text$       file name ends with text
         !text       exclude anything matching text
+      In content mode the path/name is matched first; only when a term does not
+      match the path is it looked up (case-insensitively) in the contents or,
+      for audio, in the title / artist / album. It starts one second after you
+      stop typing and streams results in. .ext and ^/$ apply to the file name.
       e.g.  downloads<Tab>.mp3<Tab>report
 
     EXAMPLES:
@@ -128,6 +146,7 @@ func printHelp() {
       \(kAppName) --app                 # Launchpad-like app launcher
       \(kAppName) --app | head          # just list app paths
       \(kAppName) ~/Downloads --enter reveal   # Enter reveals in Finder
+      \(kAppName) --content ~/notes TODO       # files containing "TODO"
     """)
 }
 
@@ -171,6 +190,30 @@ func parseTypeToken(_ raw: String) -> TypeFilter? {
     return filter.isEmpty ? nil : filter
 }
 
+/// Parses a human-readable size ("20", "512K", "1.5M", "2G"; 1024-based)
+/// into bytes. Returns nil for malformed input.
+func parseByteSize(_ raw: String) -> Int? {
+    let s = raw.trimmingCharacters(in: .whitespaces).uppercased()
+    guard !s.isEmpty else { return nil }
+    var number = s
+    var multiplier = 1
+    let suffixes: [(String, Int)] = [
+        ("KB", 1024), ("K", 1024),
+        ("MB", 1024 * 1024), ("M", 1024 * 1024),
+        ("GB", 1024 * 1024 * 1024), ("G", 1024 * 1024 * 1024),
+        ("B", 1)
+    ]
+    for (suffix, mult) in suffixes where number.hasSuffix(suffix) {
+        number = String(number.dropLast(suffix.count))
+        multiplier = mult
+        break
+    }
+    guard let value = Double(number), value >= 0 else { return nil }
+    let bytes = value * Double(multiplier)
+    guard bytes < Double(Int.max) else { return nil }
+    return Int(bytes)
+}
+
 func parseEnterAction(_ raw: String) -> Config.EnterAction? {
     switch raw.lowercased() {
     case "path", "print", "stdout", "echo":
@@ -189,6 +232,7 @@ func parseArguments(_ args: [String]) -> Config {
     var positionals: [String] = []
     var forceStdin = false
     var searchApps = false
+    var searchContent = false
 
     var i = 1
     while i < args.count {
@@ -220,6 +264,17 @@ func parseArguments(_ args: [String]) -> Config {
             cfg.autoplay = true
         case "--app":
             searchApps = true
+        case "--content":
+            searchContent = true
+        case "--max-filesize", "--max-size":
+            i += 1
+            if i < args.count {
+                guard let size = parseByteSize(args[i]) else {
+                    fputs("\(kAppName): invalid --max-filesize value: \(args[i]) (use e.g. 20M, 512K, 1G)\n", stderr)
+                    exit(1)
+                }
+                cfg.maxFileSize = size
+            }
         case "--enter":
             i += 1
             if i < args.count {
@@ -291,6 +346,11 @@ func parseArguments(_ args: [String]) -> Config {
         cfg.mode = .stdin
     } else if searchApps {
         cfg.mode = .apps
+    } else if searchContent {
+        cfg.mode = .content
+        if cfg.searchPaths.isEmpty {
+            cfg.searchPaths = [FileManager.default.currentDirectoryPath]
+        }
     } else if hasFileDirective {
         cfg.mode = .files
         if cfg.searchPaths.isEmpty {

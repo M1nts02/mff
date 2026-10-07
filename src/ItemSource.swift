@@ -80,6 +80,30 @@ struct FileSource: ItemSource {
     }
 }
 
+/// Recursively enumerates files and indexes their text contents for content
+/// search. Binary files are skipped. Kept separate from `FileSource` so the
+/// two modes never share processing logic.
+struct ContentSource: ItemSource {
+    let paths: [String]
+    let typeFilter: TypeFilter
+    let namePattern: String?
+    let includeHidden: Bool
+    let maxFileSize: Int
+
+    func load(onBatch: @escaping @MainActor ([SearchableItem]) -> Void,
+              onComplete: @escaping @MainActor () -> Void) {
+        ContentIndexer.enumerate(
+            paths: paths,
+            typeFilter: typeFilter,
+            namePattern: namePattern,
+            includeHidden: includeHidden,
+            maxFileSize: maxFileSize,
+            onBatch: onBatch,
+            onComplete: onComplete
+        )
+    }
+}
+
 /// Scans the standard application directories (Launchpad-style).
 struct AppSource: ItemSource {
     func load(onBatch: @escaping @MainActor ([SearchableItem]) -> Void,

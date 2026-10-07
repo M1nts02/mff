@@ -57,18 +57,43 @@ enum FileTypeRegistry {
         "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pages",
         "numbers", "key", "rtf", "odt", "ods", "odp", "epub", "mobi"
     ]
-    static let textExts: Set<String> = [
+    /// Lyrics and subtitle formats: part of the text category, and previewed as
+    /// plain text because Quick Look often has no generator for them.
+    static let lyricsSubtitleExts: Set<String> = [
+        "lrc", "krc", "qrc",
+        "srt", "ass", "ssa", "vtt", "sub", "sbv", "smi", "sami",
+        "ttml", "dfxp", "scc"
+    ]
+
+    static let textExts: Set<String> = Set([
         "txt", "md", "markdown", "csv", "tsv", "json", "xml", "yaml", "yml",
         "toml", "ini", "plist", "html", "htm", "css", "js", "ts", "jsx",
         "tsx", "swift", "m", "mm", "c", "h", "cpp", "hpp", "cs", "java",
         "kt", "kts", "py", "rb", "go", "rs", "php", "sh", "zsh", "bash",
-        "fish", "sql", "log", "conf", "cfg", "gitignore", "rst", "tex"
-    ]
+        "fish", "sql", "log", "conf", "cfg", "gitignore", "rst", "tex",
+        "lua"
+    ]).union(lyricsSubtitleExts)
     static let archiveExts: Set<String> = [
         "zip", "tar", "gz", "tgz", "bz2", "tbz", "xz", "txz", "7z", "rar",
         "dmg", "pkg", "iso", "deb", "rpm", "zst", "lz", "lz4"
     ]
     static let appExts: Set<String> = ["app", "bundle", "framework", "xcodeproj", "playground"]
+
+    /// Extensions treated as binary by content search; the file is skipped
+    /// without ever being read. Files with an unknown/empty extension are still
+    /// probed by content (see ContentIndexer).
+    static let binaryExts: Set<String> = imageExts
+        .union(videoExts).union(audioExts).union(archiveExts)
+        .union(documentExts).union(appExts)
+        .union([
+            "o", "a", "so", "dylib", "dll", "exe", "bin", "class", "pyc",
+            "pyo", "wasm", "db", "sqlite", "sqlite3", "ttf", "otf", "woff",
+            "woff2", "eot", "icns", "dat", "pak", "nib"
+        ])
+
+    static func isLikelyBinary(ext: String) -> Bool {
+        binaryExts.contains(ext.lowercased())
+    }
 
     static func category(for ext: String) -> FileCategory {
         let e = ext.lowercased()
@@ -131,6 +156,9 @@ struct SearchableItem {
     let lowerSearch: String    // lowercased full path (default search target)
     let lowerDisplay: String   // lowercased display name (default name search)
     let fileExtension: String  // lowercased extension without the dot ("" if none)
+    /// Text contents for content-search mode (capped size); nil in every other
+    /// mode so plain file search never pays for reading files.
+    let content: String?
 
     private static var idCounter = 0
     private static let idLock = NSLock()
@@ -153,9 +181,10 @@ struct SearchableItem {
         self.lowerSearch = text.lowercased()
         self.lowerDisplay = self.lowerSearch
         self.fileExtension = ""
+        self.content = nil
     }
 
-    init(url: URL, isDirectory: Bool) {
+    init(url: URL, isDirectory: Bool, content: String? = nil) {
         self.id = Self.nextID()
         self.raw = url.path
         let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
@@ -166,6 +195,7 @@ struct SearchableItem {
         self.lowerSearch = self.raw.lowercased()
         self.lowerDisplay = name.lowercased()
         self.fileExtension = url.pathExtension.lowercased()
+        self.content = content
     }
 }
 

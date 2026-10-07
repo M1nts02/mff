@@ -29,6 +29,30 @@ enum FuzzyMatcher {
             .map(String.init)
     }
 
+    /// Whether a content search for `new` may reuse the files skipped by `old`.
+    ///
+    /// True only when `new` is `old` with characters appended and the change is
+    /// monotonic (a longer query is strictly narrower): a whole new term is
+    /// added, or a plain / `'exact` / `^prefix` positive term is extended.
+    /// Suffix (`text$`), extension (`.ext`) and negation (`!term`) terms are not
+    /// monotonic under extension, so they force a full re-match.
+    static func canNarrow(from old: String, to new: String) -> Bool {
+        guard !old.isEmpty, new.hasPrefix(old), new.count > old.count else { return false }
+        let appended = new[new.index(new.startIndex, offsetBy: old.count)...]
+        // A new term leaves every old term untouched, so old skips still hold.
+        if appended.first == termSeparator || appended.first == "\t" {
+            return true
+        }
+        // Extending the last term must not introduce an operator.
+        if appended.contains(where: { "!$^.'".contains($0) }) { return false }
+        let lastOld = tokenize(old).last ?? ""
+        if lastOld.hasPrefix("!") || lastOld.hasSuffix("$")
+            || (lastOld.hasPrefix(".") && lastOld.count > 1) {
+            return false
+        }
+        return true
+    }
+
     /// - Parameter matchPath: `true` matches the whole path (the default for
     ///   file/stdin search); `false` matches only the file name (used by `--app`).
     static func match(query: String, in item: SearchableItem, matchPath: Bool = true) -> MatchResult? {
@@ -126,6 +150,130 @@ enum FuzzyMatcher {
     }
 
     // MARK: - Match modes
+
+    /// Content-search matching (content mode).
+    ///
+    /// Every term must match the file in one of two ways (logical AND):
+    ///   - first the file path/name, using the same rules as file mode (fuzzy
+    ///     or `'exact`); only when that fails,
+    ///   - the file contents, as a case-insensitive substring.
+    ///
+    /// A term that matches the path/name never searches the contents, and a
+    /// content search stops at the first hit (`range` returns the first
+    /// occurrence). Binary files and files above `--max-filesize` have no
+    /// indexed contents, so they are skipped for content matching but are still
+    /// matched by name/path. `.ext` filters by extension and `^`/`$` by file
+    /// name; `!` negates both sources. When a term matches the path/name its
+    /// positions are returned so the row can highlight it; content-only matches
+    /// contribute no name/path highlights.
+    static func matchContent(query: String, in item: SearchableItem) -> MatchResult? {
+        let tokens = tokenize(query)
+        if tokens.isEmpty {
+            return MatchResult(item: item, score: 0, termPositions: [])
+        }
+
+        let content = item.content ?? ""
+        let target = Array(item.lowerSearch)
+        let nameStart = max(0, item.lowerSearch.count - item.lowerDisplay.count)
+        var total = 0
+        var termPositions: [[Int]] = []
+
+        for token in tokens {
+            var body = token
+            var negate = false
+            if body.hasPrefix("!") {
+                negate = true
+                body.removeFirst()
+            }
+            if body.isEmpty { continue }
+
+            // .ext -> extension filter
+            if body.hasPrefix("."), body.count > 1 {
+                let want = String(body.dropFirst()).lowercased()
+                let suffix = "." + want
+                let ok = item.fileExtension == want || item.lowerSearch.hasSuffix(suffix)
+                if negate {
+                    if ok { return nil }
+                } else {
+                    if !ok { return nil }
+                    total += 200
+                    if item.lowerSearch.hasSuffix(suffix) {
+                        termPositions.append(Array((target.count - suffix.count)..<target.count))
+                    } else {
+                        termPositions.append([])
+                    }
+                }
+                continue
+            }
+
+            // ^text -> file name starts with
+            if body.hasPrefix("^") {
+                let t = Array(body.dropFirst().lowercased())
+                if t.isEmpty { continue }
+                let name = Array(item.lowerDisplay)
+                let ok = name.count >= t.count && Array(name.prefix(t.count)) == t
+                if negate {
+                    if ok { return nil }
+                } else {
+                    if !ok { return nil }
+                    total += 180
+                    termPositions.append(Array(nameStart..<(nameStart + t.count)))
+                }
+                continue
+            }
+
+            // text$ -> file name ends with
+            if body.hasSuffix("$") {
+                let t = Array(body.dropLast().lowercased())
+                if t.isEmpty { continue }
+                let name = Array(item.lowerDisplay)
+                let ok = name.count >= t.count && Array(name.suffix(t.count)) == t
+                if negate {
+                    if ok { return nil }
+                } else {
+                    if !ok { return nil }
+                    total += 180
+                    termPositions.append(Array((nameStart + name.count - t.count)..<(nameStart + name.count)))
+                }
+                continue
+            }
+
+            // Plain (or 'exact) term -> the file path (same rules as file
+            // mode) OR a case-insensitive substring of the contents. Binary and
+            // oversized files have no contents but still match on the path.
+            let isExact = body.hasPrefix("'")
+            let text = isExact ? String(body.dropFirst()) : body
+            let t = Array(text.lowercased())
+            if t.isEmpty { continue }
+
+            let pathResult: (score: Int, positions: [Int])? = isExact
+                ? exact(t, in: target)
+                : fuzzy(t, in: target)
+
+            // Path/name matches take priority: only fall back to searching the
+            // contents when the term did not match the path. A content search
+            // stops at the first hit and marks the term as satisfied.
+            if negate {
+                if pathResult != nil { return nil }
+                if content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+                    return nil
+                }
+            } else if let pr = pathResult {
+                total += pr.score
+                termPositions.append(pr.positions)
+            } else if let contentHit = content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive]) {
+                // Earlier content matches rank a little higher; bounded so the
+                // score stays cheap to compute on large contents.
+                let offset = content.distance(from: content.startIndex, to: contentHit.lowerBound)
+                total += 120 + max(0, 60 - min(offset / 32, 60))
+                termPositions.append([])
+            } else {
+                return nil
+            }
+        }
+
+        return MatchResult(item: item, score: total, termPositions: termPositions)
+    }
 
     private static func exact(_ t: [Character], in s: [Character]) -> (Int, [Int])? {
         let m = t.count, n = s.count

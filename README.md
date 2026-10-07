@@ -9,18 +9,20 @@ behaviour. Built with Swift and xmake.
   fzf-style.
 - **files** — a path / type / `--name` is given: search the filesystem
   (mdfind-style). `⌘G` changes the search folder with path completion.
+- **content** — `--content`: like file search, but the query is also matched
+  against the text contents of regular files and audio metadata (title / artist /
+  album). Matching starts one second after you stop typing, then results stream
+  in as the tree is scanned.
 - **apps** — `--app`: search applications by name (Launchpad-style); launches on
   Enter when interactive.
 
 ## Features
 
-- Embedded preview (file mode): Quick Look for documents / images / folders, a
-  player with cover art for audio / video. FLAC/OGG/Opus tags and MKV/WebM
-  cover art are read natively.
-- Drag & drop (file mode): drag a result out to a Finder folder to move/copy
-  it, or onto an app (e.g. the Dock) to open it. When several files are marked,
-  dragging one marked row drags them all. Finder handles duplicate-name
-  conflicts (keep both / replace / stop). The app exits after the drag.
+- Embedded preview: Quick Look for documents / images / folders, a player with
+  cover art for audio / video, and plain text for lyrics / subtitles. FLAC/OGG/Opus
+  tags and MKV/WebM covers are read natively.
+- Drag & drop: drag results out to Finder to move/copy them, or onto an app to
+  open them (marked rows are dragged together).
 
 ## Usage
 
@@ -28,14 +30,13 @@ behaviour. Built with Swift and xmake.
 
 ```bash
 xmake b
-# binary: build/macosx/arm64/release/mff
 ```
 
 ### Package (universal zip)
 
 ```bash
 ./package.sh
-# dist/mff-<version>-macosx-universal.zip  (arm64 + x86_64)
+# dist/mff-<version>-macosx-universal.zip
 ```
 
 Bump `VERSION` at the top of `package.sh` to release a new version; it is
@@ -55,14 +56,18 @@ mff ~/Music .mp3                   # find .mp3 files under ~/Music
 mff -p ~/Downloads -t video,image  # videos/images in Downloads
 mff --app                          # app search (Enter launches)
 mff -p ~/Downloads --enter reveal  # Enter reveals in Finder
+mff --content ~/notes TODO         # files whose contents contain "TODO"
 ```
 
 ### Preview
 
 - Documents / images / folders — Finder-style Quick Look.
-- Audio — embedded player with cover art. FLAC, OGG and Opus tag/cover metadata
-  is parsed natively (AVFoundation does not expose it); other formats fall back
-  to AVFoundation metadata.
+- Lyrics / subtitles (`.lrc`, `.srt`, `.ass`, `.vtt`, …) — shown as plain
+  text in the preview pane.
+- Audio — embedded player with cover art and title / artist / album captions
+  (search hits are highlighted in content mode). FLAC, OGG and Opus tag/cover
+  metadata is parsed natively (AVFoundation does not expose it); other formats
+  fall back to AVFoundation metadata.
 - Video — the built-in player for containers AVFoundation can decode (mp4, mov,
   …); MKV/WebM show their embedded cover image (a Matroska attachment) or a
   placeholder.
@@ -75,13 +80,41 @@ ordinary characters. Every term must match (AND) somewhere in the **whole path**
 
 `text` fuzzy · `'text` exact · `.ext` extension · `^pre` / `suf$` name start/end · `!x` exclude
 
+In content mode (`--content`) the path/name is matched first; only if a term
+does not match the path is it looked up (case-insensitively) in the contents or,
+for audio, in the title / artist / album. Matching does not run while you type —
+it starts one second after the input stops, then streams results in. `.ext` and
+`^`/`$` still apply to the file name.
+
+### File types
+
+`-t` / `--type` accepts a category name or an explicit extension (`.mp3`,
+`tar.gz`, …), comma-separated. Categories and their extensions:
+
+| Category | Extensions |
+| --- | --- |
+| `image` | jpg, jpeg, png, gif, heic, heif, webp, tiff, tif, bmp, svg, ico, raw, cr2, nef, arw, dng, psd, ai, eps, avif, jp2, jxl |
+| `video` | mp4, mov, m4v, avi, mkv, webm, flv, wmv, mpg, mpeg, 3gp, mts, m2ts, ts, ogv, vob |
+| `audio` | mp3, wav, aac, m4a, flac, ogg, wma, aiff, aif, alac, opus, mid, midi, ape, amr |
+| `document` | pdf, doc, docx, xls, xlsx, ppt, pptx, pages, numbers, key, rtf, odt, ods, odp, epub, mobi |
+| `text` | txt, md, markdown, csv, tsv, json, xml, yaml, yml, toml, ini, plist, html, htm, css, js, ts, jsx, tsx, swift, m, mm, c, h, cpp, hpp, cs, java, kt, kts, py, rb, go, rs, php, sh, zsh, bash, fish, sql, log, conf, cfg, gitignore, rst, tex, lua, lrc, krc, qrc, srt, ass, ssa, vtt, sub, sbv, smi, sami, ttml, dfxp, scc |
+| `archive` | zip, tar, gz, tgz, bz2, tbz, xz, txz, 7z, rar, dmg, pkg, iso, deb, rpm, zst, lz, lz4 |
+| `folder` | any directory |
+| `app` | app, bundle, framework, xcodeproj, playground (use `--app`) |
+
+`text` includes source code, config files, lyrics (`.lrc`, `.krc`, `.qrc`) and
+subtitles (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub`, `.sbv`, `.smi`, `.sami`,
+`.ttml`, `.dfxp`, `.scc`). Lyrics and subtitles are previewed as plain text.
+
 ### Options
 
 | Option | Description |
 | --- | --- |
 | `PATH` / `-p, --path DIR` | Directory to search (repeatable; default: cwd). `--onlyin` is an alias |
-| `-t, --type TYPE` | Type filter: category (image/video/audio/document/text/archive/folder) or extension (`.mp3`), comma-separated |
+| `-t, --type TYPE` | Type filter: category or extension (see **File types** below), comma-separated |
 | `--app` | Search applications by name (Launchpad-style; launches on Enter when interactive) |
+| `--content` | Content mode: also match text contents and audio title / artist / album |
+| `--max-filesize SIZE` | Content mode: don't search the contents of files larger than SIZE (`K`/`M`/`G`, 1024-based, or bytes; `0` = no limit; default `20M`) |
 | `--stdin` | Force stdin mode: read items from stdin even when a path/type argument is given |
 | `-q, --query TEXT` | Initial query |
 | `--enter path\|open\|reveal` | Enter action (default `path`); `--open` = `--enter open` |
@@ -107,7 +140,7 @@ ordinary characters. Every term must match (AND) somewhere in the **whole path**
 | `⌘⇧M` | Clear all marks (`--multi`) |
 | `⌘⇧A` | Mark all rows (`--multi`) |
 | `⌘G` | Change the search folder (⌘1-9/Tab complete, `↩` confirm) |
-| `⌘T` | Open the file-type selector (file search) |
+| `⌘T` | Open the file-type selector (file/content search) |
 | `⌘1`–`⌘9` | Select the Nth row (rows 1–9 show their number) |
 | `esc` / `ctrl+c` | Cancel |
 
@@ -120,7 +153,7 @@ completes (descends into) the highlighted folder, `⌘1`–`⌘9` completes the 
 - Left: `Mark` / `Clear Marks` (multi-select, same as `⌘M` / `⌘⇧M`), then
   `Open` / `Reveal in Finder` / `Return` (same as `⌘O` / `⌘R` / `↩`).
 - Right: `⌘G` folder picker (change the search folder; the list goes full width
-  and the preview is hidden while picking) and, for file search, the file-type
+  and the preview is hidden while picking) and, for file/content search, the file-type
   popup (same as `⌘T`).
 
 ## Credits
