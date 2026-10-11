@@ -6,7 +6,11 @@ behaviour. Built with Swift and xmake.
 ## Modes
 
 - **stdin** — no path/type argument (or `--stdin`): read lines from stdin,
-  fzf-style.
+  fzf-style. With `--stdin files` each line is treated as a filesystem path and
+  browsed like a file result (icons, Quick Look preview, drag-out,
+  open/reveal; app bundles are handled as files) — handy with `zoxide` or
+  `mdfind`. `~` and relative paths are expanded, and `-t` / `--name` filter the
+  piped paths.
 - **files** — a path / type / `--name` is given: search the filesystem
   (mdfind-style). `⌘G` changes the search folder with path completion.
 - **content** — `--content`: like file search, but the query is also matched
@@ -22,7 +26,8 @@ behaviour. Built with Swift and xmake.
   cover art for audio / video, and plain text for lyrics / subtitles. FLAC/OGG/Opus
   tags and MKV/WebM covers are read natively.
 - Drag & drop: drag results out to Finder to move/copy them, or onto an app to
-  open them (marked rows are dragged together).
+  open them (marked rows are dragged together). Available in file, content and
+  `--stdin files` modes.
 
 ## Usage
 
@@ -52,6 +57,8 @@ brew install m1nts02/tap/mff
 
 ```bash
 ls | mff                           # fzf: pick from stdin
+zoxide query -l | mff --stdin files  # browse zoxide dirs as files
+mdfind -0 kMDItemFSName=foo | mff --stdin files  # browse mdfind results
 mff ~/Music .mp3                   # find .mp3 files under ~/Music
 mff -p ~/Downloads -t video,image  # videos/images in Downloads
 mff --app                          # app search (Enter launches)
@@ -73,12 +80,20 @@ mff --content ~/notes TODO         # files whose contents contain "TODO"
   placeholder.
 - `⌘↩` toggles auto-play of audio/video previews.
 
+Previews work in file, content and `--stdin files` search (app bundles use
+Quick Look). `--app` search is a compact launcher without a preview pane.
+
 ### Search
 
 Terms are separated by **Tab** (press Tab to insert a separator); spaces are
 ordinary characters. Every term must match (AND) somewhere in the **whole path**.
 
 `text` fuzzy · `'text` exact · `.ext` extension · `^pre` / `suf$` name start/end · `!x` exclude
+
+In `--stdin files` mode the piped paths are matched against the whole path
+(just like file search); `-t` / `--type` and `--name` are applied while reading
+the paths. App bundles such as `.app` are ordinary file results with their real
+bundle icon.
 
 In content mode (`--content`) the path/name is matched first; only if a term
 does not match the path is it looked up (case-insensitively) in the contents or,
@@ -115,7 +130,8 @@ subtitles (`.srt`, `.ass`, `.ssa`, `.vtt`, `.sub`, `.sbv`, `.smi`, `.sami`,
 | `--app` | Search applications by name (Launchpad-style; launches on Enter when interactive) |
 | `--content` | Content mode: also match text contents and audio title / artist / album |
 | `--max-filesize SIZE` | Content mode: don't search the contents of files larger than SIZE (`K`/`M`/`G`, 1024-based, or bytes; `0` = no limit; default `20M`) |
-| `--stdin` | Force stdin mode: read items from stdin even when a path/type argument is given |
+| `--stdin [MODE]` | Force stdin mode: read items from stdin even when a path/type argument is given. Optional `MODE`: `lines` (raw strings, default) or `files` (each line is a path, browsed like a file; app bundles handled as files; `-t`/`--name` filter them). |
+| `--stdin-files` | Shorthand for `--stdin files`. |
 | `-q, --query TEXT` | Initial query |
 | `--enter path\|open\|reveal` | Enter action (default `path`); `--open` = `--enter open` |
 | `--multi` | Allow multi-select (not with `--app`); `⇧↑/↓` extends, `⌘M` marks, `⌘⇧M` clears marks, `⌘⇧A` marks all |

@@ -14,7 +14,10 @@ func printHelp() {
       \(kAppName) [OPTIONS] [PATH|TYPE ...]
 
     MODES:
-      stdin    No path/type argument: read lines from stdin (fzf-style).
+      stdin    No path/type argument (or --stdin): read lines from stdin
+               (fzf-style). With --stdin files each line is a path and is
+               browsed like a file result (preview, drag-out, open/reveal;
+               app bundles are handled as files).
       files    A path/type/--name is given: search the filesystem (mdfind-style).
       content  --content: like files, but also matches text contents and audio
                metadata (title / artist / album).
@@ -32,8 +35,17 @@ func printHelp() {
       QUERY                Anything else is used as the initial search query.
 
     OPTIONS:
-          --stdin          Force stdin mode: read items from stdin even when a
-                           path or type argument is given.
+          --stdin [MODE]   Force stdin mode: read items from stdin even when a
+                           path or type argument is given. MODE is optional:
+                             lines   keep each line as a raw string (default)
+                             files   treat each line as a path and browse it
+                                     like a file result (icons, Quick Look
+                                     preview, drag-out, open/reveal). Tilde
+                                     and relative paths are expanded, and
+                                     -t/--type and --name filter the paths.
+                           Examples: `zoxide query -l | mff --stdin files`,
+                                     `mdfind -0 ... | mff --stdin files`.
+          --stdin-files    Shorthand for `--stdin files`.
           --app            Use apps mode: search applications by name (like
                            Launchpad). Matches the app name only (not the full
                            path); opens the selected app on Enter when
@@ -67,7 +79,8 @@ func printHelp() {
       -q, --query TEXT     Initial search query.
       -n ROWS              Number of visible rows (default: 10).
       -w WIDTH             List area width in points (default: 720); the preview
-                           pane is added on the right in file/content mode.
+                           pane is added on the right in file/content/stdin-files
+                           mode.
       -0                   Print selection followed by a NUL byte.
       -1                   Auto-select if exactly one match remains.
       -i                   Print the index of the selected item instead of it.
@@ -104,7 +117,7 @@ func printHelp() {
       Type popup (file/content search)   filter results by file type
       Folder (bottom right)              change the search folder (⌘G)
 
-    DRAG & DROP (file/content search):
+    DRAG & DROP (file/content/stdin-files search):
       Drag a result out to a Finder folder to move/copy it, or onto an app
       (e.g. the Dock) to open it. When several files are marked, dragging one
       marked row drags them all. Finder shows the usual duplicate-name dialog
@@ -145,6 +158,8 @@ func printHelp() {
       \(kAppName) -t image -q cat
       \(kAppName) --app                 # Launchpad-like app launcher
       \(kAppName) --app | head          # just list app paths
+      zoxide query -l | \(kAppName) --stdin files   # browse dirs/files from stdin
+      mdfind -0 kMDItemFSName=foo | \(kAppName) --stdin files
       \(kAppName) ~/Downloads --enter reveal   # Enter reveals in Finder
       \(kAppName) --content ~/notes TODO       # files containing "TODO"
     """)
@@ -227,10 +242,23 @@ func parseEnterAction(_ raw: String) -> Config.EnterAction? {
     }
 }
 
+/// Parses the optional argument to `--stdin` describing how lines are read.
+func parseStdinKind(_ raw: String) -> Config.StdinKind? {
+    switch raw.lowercased() {
+    case "lines", "line", "text", "raw", "strings":
+        return .lines
+    case "files", "file", "paths", "path", "dirs", "dir", "directories", "apps", "app":
+        return .files
+    default:
+        return nil
+    }
+}
+
 func parseArguments(_ args: [String]) -> Config {
     var cfg = Config()
     var positionals: [String] = []
     var forceStdin = false
+    var stdinKind: Config.StdinKind = .lines
     var searchApps = false
     var searchContent = false
 
@@ -260,6 +288,14 @@ func parseArguments(_ args: [String]) -> Config {
             cfg.noPreview = true
         case "--stdin":
             forceStdin = true
+            // Optional mode argument: `--stdin files`, `--stdin apps`.
+            if i + 1 < args.count, let kind = parseStdinKind(args[i + 1]) {
+                stdinKind = kind
+                i += 1
+            }
+        case "--stdin-files":
+            forceStdin = true
+            stdinKind = .files
         case "--autoplay":
             cfg.autoplay = true
         case "--app":
@@ -314,7 +350,15 @@ func parseArguments(_ args: [String]) -> Config {
             i += 1
             if i < args.count { cfg.namePattern = args[i] }
         default:
-            if a.hasPrefix("-"), a.count > 1 {
+            if a.hasPrefix("--stdin=") {
+                forceStdin = true
+                let value = String(a.dropFirst("--stdin=".count))
+                guard let kind = parseStdinKind(value) else {
+                    fputs("\(kAppName): invalid --stdin value: \(value) (use lines or files)\n", stderr)
+                    exit(1)
+                }
+                stdinKind = kind
+            } else if a.hasPrefix("-"), a.count > 1 {
                 fputs("\(kAppName): unknown option: \(a)\n", stderr)
                 printHelp()
                 exit(1)
@@ -338,12 +382,16 @@ func parseArguments(_ args: [String]) -> Config {
         }
     }
 
-    // Decide mode: --stdin forces stdin; --app always selects app search;
-    // otherwise any file directive selects a filesystem search.
+    // Decide mode: --stdin forces stdin (optionally as files/apps); --app always
+    // selects app search; otherwise any file directive selects a filesystem
+    // search.
     let hasFileDirective = !cfg.searchPaths.isEmpty || !cfg.typeFilter.isEmpty
         || cfg.namePattern != nil
     if forceStdin {
-        cfg.mode = .stdin
+        switch stdinKind {
+        case .lines: cfg.mode = .stdin
+        case .files: cfg.mode = .stdinFiles
+        }
     } else if searchApps {
         cfg.mode = .apps
     } else if searchContent {

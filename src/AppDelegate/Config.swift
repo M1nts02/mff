@@ -28,9 +28,18 @@ struct Config {
 
     enum Mode {
         case stdin
+        /// stdin, but every line is a filesystem path shown as a file item
+        /// (icons, Quick Look preview, drag-out, Open / Reveal).
+        case stdinFiles
         case files
         case content
         case apps
+    }
+
+    /// How lines read from stdin are interpreted.
+    enum StdinKind {
+        case lines
+        case files
     }
 
     /// What the Enter key does in file / app search.

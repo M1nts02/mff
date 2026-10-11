@@ -98,10 +98,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     var isContentSearch: Bool { config.mode == .content }
     var isAppSearch: Bool { config.mode == .apps }
     var isStdin: Bool { config.mode == .stdin }
-
+    /// Modes whose items are real filesystem URLs, so Quick Look previews,
+    /// icons, drag-out and Open / Reveal all make sense.
+    var isFileLike: Bool {
+        config.mode == .files || config.mode == .content || config.mode == .stdinFiles
+    }
     var showsPreview: Bool {
         // App search is a compact launcher; it does not need a preview pane.
-        return isFileSearch && !config.noPreview
+        return isFileLike && !config.noPreview
     }
 
     /// Multi-select is available everywhere except app search.
@@ -258,7 +262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchField.isBezeled = false
         searchField.isBordered = false
         searchField.placeholderString = isContentSearch ? "Search file contents"
-            : (isFileSearch ? "Search files" : (isAppSearch ? "Search apps" : "Search"))
+            : (isFileLike ? "Search files" : (isAppSearch ? "Search apps" : "Search"))
         searchField.autoresizingMask = [.width]
 
         if let cell = searchField.cell as? NSSearchFieldCell {
@@ -586,7 +590,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let source: ItemSource
         switch config.mode {
         case .stdin:
-            source = StdinSource()
+            source = StdinSource(kind: .lines)
+        case .stdinFiles:
+            source = StdinSource(
+                kind: .files,
+                typeFilter: config.typeFilter,
+                namePattern: config.namePattern
+            )
         case .files:
             source = FileSource(
                 paths: config.searchPaths,
@@ -703,6 +713,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             switch config.mode {
             case .files: text = "\(total) files"
             case .content: text = "\(total) files"
+            case .stdinFiles: text = "\(total) files"
             case .apps: text = "\(total) apps"
             case .stdin: text = "\(total) lines"
             }
@@ -736,10 +747,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: Drag out (file search only)
 
     /// Enables dragging a search result out to Finder (move/copy) or onto an
-    /// app (open). Only file search rows have a URL, so stdin/app rows and the
+    /// app (open). Rows without a URL (raw stdin lines, app rows) and the
     /// folder picker are automatically non-draggable.
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
-        guard isFileSearch, !isEditingPath else { return nil }
+        guard isFileLike, !isEditingPath else { return nil }
         guard filteredMatches.indices.contains(row) else { return nil }
         guard let url = filteredMatches[row].item.url else { return nil }
         return url as NSURL
@@ -750,7 +761,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     /// the usual duplicate-name conflict dialog (keep both / replace / stop).
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
         isDragging = true
-        guard isFileSearch, !isEditingPath, multiSelection.count > 1 else { return }
+        guard isFileLike, !isEditingPath, multiSelection.count > 1 else { return }
         guard !rowIndexes.intersection(IndexSet(multiSelection)).isEmpty else { return }
 
         let urls = multiSelection.sorted().compactMap { itemForRow($0)?.url }

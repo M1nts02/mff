@@ -11,8 +11,14 @@ protocol ItemSource {
     )
 }
 
-/// Reads newline-separated items from stdin (fzf-style).
+/// Reads newline-separated items from stdin (fzf-style). Depending on `kind`,
+/// each line is either kept as a raw string or resolved to a filesystem path
+/// so it can be browsed (and previewed / opened) like a file or app result.
 struct StdinSource: ItemSource {
+    var kind: Config.StdinKind = .lines
+    var typeFilter = TypeFilter()
+    var namePattern: String?
+
     func load(onBatch: @escaping @MainActor ([SearchableItem]) -> Void,
               onComplete: @escaping @MainActor () -> Void) {
         if isatty(FileHandle.standardInput.fileDescriptor) != 0 {
@@ -20,12 +26,36 @@ struct StdinSource: ItemSource {
             exit(1)
         }
 
+        let kind = self.kind
+        let typeFilter = self.typeFilter
+        let loweredName = namePattern?.lowercased()
+
         DispatchQueue.global(qos: .userInitiated).async {
             let handle = FileHandle.standardInput
             let chunkSize = 64 * 1024
             var pending = ""
             var batch: [String] = []
             batch.reserveCapacity(512)
+
+            func flush() {
+                guard !batch.isEmpty else { return }
+                let chunk = batch
+                batch.removeAll(keepingCapacity: true)
+                let items = chunk.compactMap { line -> SearchableItem? in
+                    switch kind {
+                    case .lines:
+                        return SearchableItem(text: line)
+                    case .files:
+                        return StdinSource.fileItem(
+                            for: line,
+                            typeFilter: typeFilter,
+                            loweredName: loweredName
+                        )
+                    }
+                }
+                guard !items.isEmpty else { return }
+                DispatchQueue.main.async { onBatch(items) }
+            }
 
             while true {
                 let data = handle.readData(ofLength: chunkSize)
@@ -38,25 +68,39 @@ struct StdinSource: ItemSource {
                     text = String(text[range.upperBound...])
                     if !line.isEmpty {
                         batch.append(line)
-                        if batch.count >= 512 {
-                            let chunk = batch
-                            batch.removeAll(keepingCapacity: true)
-                            let items = chunk.map { SearchableItem(text: $0) }
-                            DispatchQueue.main.async { onBatch(items) }
-                        }
+                        if batch.count >= 512 { flush() }
                     }
                 }
                 pending = text
             }
 
             if !pending.isEmpty { batch.append(pending) }
-            if !batch.isEmpty {
-                let chunk = batch
-                let items = chunk.map { SearchableItem(text: $0) }
-                DispatchQueue.main.async { onBatch(items) }
-            }
+            flush()
             DispatchQueue.main.async { onComplete() }
         }
+    }
+
+    /// Resolves a stdin line to a file item. Tilde and relative paths are
+    /// expanded so `zoxide`-style output and hand-typed paths both work.
+    private static func fileItem(for line: String,
+                                 typeFilter: TypeFilter,
+                                 loweredName: String?) -> SearchableItem? {
+        var path = (line as NSString).expandingTildeInPath
+        if !(path as NSString).isAbsolutePath {
+            path = (FileManager.default.currentDirectoryPath as NSString)
+                .appendingPathComponent(path)
+        }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let isDir = isDirectory(url.path)
+
+        if let loweredName, !url.lastPathComponent.lowercased().contains(loweredName) {
+            return nil
+        }
+        if !typeFilter.isEmpty,
+           !typeFilter.matches(url: url, ext: url.pathExtension, isDirectory: isDir) {
+            return nil
+        }
+        return SearchableItem(url: url, isDirectory: isDir)
     }
 }
 
