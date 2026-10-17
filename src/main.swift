@@ -20,8 +20,7 @@ func printHelp() {
                stdin mode). --content / --binary are modifiers, not modes.
       apps     --app: search applications by name.
     
-      Commands:  config path | edit | validate | show ;
-                 index rebuild [--volume PATH] | clean | stop | status
+      Commands:  index rebuild [--volume PATH] | clean | stop | status
       Index:     --index-daemon (start)  ·  --no-index (bypass)
 
     ARGUMENTS:
@@ -87,6 +86,15 @@ func printHelp() {
       -h, --help           Show this help and exit.
       -v, --version        Show version and exit.
 
+    CONFIG:
+      ~/.config/mff/config.toml (not created automatically). `--config PATH` /
+      $MFF_CONFIG change the path; `--no-config` ignores it. Keys:
+        exclude = [...]                  # never searched, any mode
+        [ui] icons, preview, rows, width, keybinding
+        [icons.overrides] ext = app name / bundle id / path
+        [index] enabled, volumes, external_volumes, exclude
+      Full reference: doc/config.md; annotated example: config.example.toml.
+
     EXAMPLES:
       ls | \(kAppName)
       \(kAppName) ~/Music .mp3
@@ -96,13 +104,15 @@ func printHelp() {
       \(kAppName) --app                 # Launchpad-like app launcher
       \(kAppName) --app | head          # just list app paths
       zoxide query -l | \(kAppName) --stdin files   # browse dirs/files from stdin
-      mdfind -0 kMDItemFSName=foo | \(kAppName) --stdin files
+      mdfind kMDItemFSName=foo | \(kAppName) --stdin files   # newline-separated
+      \(kAppName) agent -p ~/src               # query "agent" (bare words are queries)
+      \(kAppName) -p ~/src .swift              # files with the .swift extension
+      \(kAppName) -p ~/src --no-index swift    # force a live walk (no index daemon)
       \(kAppName) ~/Downloads --enter reveal   # Enter reveals in Finder
       \(kAppName) --content ~/notes TODO       # files containing "TODO"
       \(kAppName) --binary ~/Music neon        # audio by metadata
       \(kAppName) --content --binary ~/x term  # text OR binary metadata
       \(kAppName) --content --stdin files      # piped paths, search contents
-      \(kAppName) config path|edit|validate|show  # manage ~/.config/mff/config.toml
       \(kAppName) index status                 # daemon + per-volume state (shows a pending version rebuild)
       \(kAppName) index rebuild --volume /Volumes/X   # rebuild one volume
       \(kAppName) index clean|stop             # delete the index / stop the daemon
@@ -434,137 +444,6 @@ func parseArguments(_ args: [String], configFile cfgFile: ConfigFile) -> Config 
     return cfg
 }
 
-// MARK: - Config subcommands
-
-/// Handles `mff config path|edit|validate`. Returns true if a subcommand ran
-/// (so the caller should not start the GUI).
-func handleConfigCommand(_ args: [String]) -> Bool {
-    guard args.count >= 2, args[1] == "config" else { return false }
-
-    // Allow an optional --config PATH after the subcommand.
-    var pathOverride: String?
-    var sub: String?
-    var i = 2
-    while i < args.count {
-        let a = args[i]
-        if a == "--config" {
-            i += 1
-            if i < args.count { pathOverride = args[i] }
-        } else {
-            sub = a
-        }
-        i += 1
-    }
-    let path = ConfigFileLoader.defaultPath(override: pathOverride)
-    let subcommand = sub ?? "path"
-
-    switch subcommand {
-    case "path":
-        print(path)
-        exit(0)
-    case "edit":
-        let dir = (path as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: path) {
-            try? defaultConfigTemplate.write(toFile: path, atomically: true, encoding: .utf8)
-        }
-        let editor = ProcessInfo.processInfo.environment["EDITOR"] ?? "vi"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = [editor, path]
-        try? p.run()
-        p.waitUntilExit()
-        exit(0)
-    case "validate":
-        if !FileManager.default.fileExists(atPath: path) {
-            fputs("\(kAppName): config not found: \(path)\n", stderr)
-            exit(1)
-        }
-        let parsed = ConfigFileLoader.load(path: path)
-        var ok = true
-        // Parser warnings (unknown keys/tables, bad values) are already printed
-        // to stderr by the loader; fold them into the pass/fail result here.
-        if !parsed.warnings.isEmpty { ok = false }
-        if ok {
-            print("\(kAppName): \(path) OK")
-            exit(0)
-        }
-        exit(1)
-    case "show":
-        let parsed = ConfigFileLoader.load(path: path)
-        print(renderConfig(parsed, path: path))
-        exit(0)
-    default:
-        fputs("\(kAppName): unknown config subcommand '\(subcommand)' (use path, edit, validate or show)\n", stderr)
-        exit(1)
-    }
-}
-
-/// Human-readable dump of the effective parsed config (`mff config show`).
-func renderConfig(_ cfg: ConfigFile, path: String) -> String {
-    var out = "config: \(path)\n"
-    out += "exclude: \(cfg.exclude.isEmpty ? "[]" : cfg.exclude.joined(separator: ", "))\n"
-
-    out += "\n[ui]\n"
-    func uiLine(_ k: String, _ v: Any?) {
-        out += "  \(k) = \(v.map { String(describing: $0) } ?? "(unset)")\n"
-    }
-    uiLine("icons", cfg.uiIcons)
-    uiLine("preview", cfg.uiPreview)
-    uiLine("keybinding", cfg.uiKeybinding)
-    uiLine("rows", cfg.uiRows)
-    uiLine("width", cfg.uiWidth)
-
-    if !cfg.icons.isEmpty {
-        out += "\n[icons.overrides] (\(cfg.icons.count))\n"
-        for key in cfg.icons.keys.sorted() { out += "  \(key) = \(cfg.icons[key]!)\n" }
-    }
-    out += "\n[index]\n  volumes = \(cfg.indexVolumes)\n  exclude = \(cfg.indexExclude)\n"
-
-    if !cfg.warnings.isEmpty {
-        out += "\nwarnings (\(cfg.warnings.count)):\n"
-        for w in cfg.warnings { out += "  \(w)\n" }
-    }
-    return out
-}
-
-let defaultConfigTemplate = """
-# mff configuration — see https://github.com/m1nts02/mff
-
-# Paths never searched in ANY mode (indexed or live). Glob-ish patterns; add
-# more with `--exclude` on the command line.
-# exclude = ["**/node_modules", "**/.git", "*.tmp"]
-
-# Everything is configured here (no settings panel). CLI flags still win.
-[ui]
-# icons = true
-# preview = true
-# rows = 10
-# width = 720
-# keybinding = "cmd+space"   # global hotkey; keeps mff resident in the menu bar
-
-# Override icons per extension.
-# [icons.overrides]
-# rs = "dev.rust"
-
-# Optional filename index (start with `mff --index-daemon`).
-# `exclude` keeps paths out of the index (glob: **/name, **/name/**, *.ext;
-# a leading ~ or ${HOME} expands to your home directory).
-# [index]
-# enabled = true                                  # may a plain mff use the daemon?
-# volumes = "auto"                                # built-in volumes (auto/none/list)
-# external_volumes = "none"                       # external: none (default) | all | list (exFAT ok)
-# exclude = [
-#     "**/node_modules", "**/target", "**/build", "**/dist", "**/out",
-#     "**/DerivedData", "**/.build", "**/.gradle", "**/__pycache__",
-#     "**/.venv", "**/Pods", "**/.git", "**/.hg", "**/.svn",
-#     "**/.idea", "**/.vscode", "**/.Spotlight-V100", "**/.fseventsd",
-#     "~/Library/Caches", "~/Library/Containers",
-#     "~/Library/Application Support", "~/.cache",
-#     "*.tmp", "*.log", "*.swp",
-# ]
-"""
-
 // MARK: - Index subcommands
 
 /// Handles `mff index rebuild|clean|stop|status`. Returns true if a subcommand ran.
@@ -611,7 +490,7 @@ func handleIndexCommand(_ args: [String]) -> Bool {
             exit(1)
         }
     case "status":
-        IndexManager.status()
+        IndexManager.status(daemonConfig: config)
         exit(0)
     default:
         fputs("\(kAppName): unknown index subcommand '\(subcommand)' (use rebuild, clean, stop or status)\n", stderr)
@@ -651,7 +530,6 @@ func runSelfTest(_ args: [String]) -> Int32 {
 // MARK: - Entry point
 
 if CommandLine.arguments.dropFirst().contains("--self-test") { exit(runSelfTest(CommandLine.arguments)) }
-if handleConfigCommand(CommandLine.arguments) { exit(0) }
 if handleIndexCommand(CommandLine.arguments) { exit(0) }
 
 // Parse --config / --no-config out of the argument list; everything else is
@@ -682,7 +560,7 @@ let config = parseArguments(passthrough, configFile: loadedConfig)
 
 // Index daemon mode: become the resident index process instead of the GUI.
 if config.indexDaemon {
-    let daemon = IndexDaemon(config: loadedConfig)
+    let daemon = IndexDaemon(config: loadedConfig, configPath: resolvedConfigPath)
     // Refuse to start a second daemon before doing any (expensive) index work.
     guard daemon.claimSingleInstance() else {
         if let probe = IndexClient().probe() {

@@ -26,7 +26,7 @@ struct ConfigFile {
     var uiRows: Int?
     var uiWidth: Double?
     /// Non-fatal problems found while parsing (unknown keys/tables, bad values).
-    /// Empty for a clean file; `config validate` surfaces these.
+    /// Empty for a clean file; each is printed to stderr when the file loads.
     var warnings: [String] = []
 }
 
@@ -62,6 +62,7 @@ enum ConfigFileLoader {
             return ConfigFile()
         }
         var parser = TOMLParser(text: text, path: path)
+        // `warn` prints each problem as it is found (once per load).
         return parser.parse()
     }
 }

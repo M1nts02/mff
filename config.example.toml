@@ -1,8 +1,8 @@
 # mff configuration — see https://github.com/m1nts02/mff
 #
-# Heavily annotated example (same keys as the template `mff config edit`
-# generates, with more commentary). Copy it to ~/.config/mff/config.toml, or
-# point mff at it with `mff --config config.example.toml`.
+# Fully annotated example of every supported key. Copy it to
+# ~/.config/mff/config.toml (create the directory if needed), or point mff at it
+# with `mff --config config.example.toml`.
 
 # Paths never searched in ANY mode (indexed or live). Glob-ish patterns; add
 # more with `--exclude` on the command line.

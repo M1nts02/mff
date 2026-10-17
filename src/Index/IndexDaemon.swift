@@ -13,7 +13,11 @@ import AppKit
 /// checkpoint. Any volume that is not ready is simply skipped and reported as
 /// `partial`, so clients can fall back to a live walk.
 final class IndexDaemon {
-    private let config: ConfigFile
+    /// The live `config.toml`. Mutable so edits (e.g. adding
+    /// `external_volumes = "all"`) take effect without restarting the daemon.
+    private var config: ConfigFile
+    /// Path the config was loaded from (re-read on change / per search).
+    private let configPath: String
     private var listenFD: Int32 = -1
     /// Guards `shards`, `manifest` and each shard's overlay.
     private let lock = NSLock()
@@ -26,8 +30,9 @@ final class IndexDaemon {
     /// Debounced overlay persistence.
     private var overlaySaveWork: [String: DispatchWorkItem] = [:]
 
-    init(config: ConfigFile) {
+    init(config: ConfigFile, configPath: String) {
         self.config = config
+        self.configPath = configPath
         IndexPaths.ensureDirectory()
     }
 
@@ -120,11 +125,18 @@ final class IndexDaemon {
 
     // MARK: - FSEvents per volume
 
-    private func startWatching(_ shard: VolumeShard) {
+    /// (Re)starts the FSEvents stream for a shard. Returns false when the
+    /// volume cannot be watched.
+    @discardableResult
+    private func startWatching(_ shard: VolumeShard) -> Bool {
         guard shard.volume.supportsEvents else {
             fputs("\(kAppName): \(shard.volume.path): no FSEvents (\(shard.volume.fs)); index is static\n", stderr)
-            return
+            return false
         }
+        lock.lock()
+        let alreadyWatched = watchers[shard.volume.id] != nil
+        lock.unlock()
+        if alreadyWatched { return true }
         lock.lock()
         let since = shard.lastEventID
         lock.unlock()
@@ -133,9 +145,10 @@ final class IndexDaemon {
         }
         if watcher.start() {
             lock.lock(); watchers[shard.volume.id] = watcher; lock.unlock()
-        } else {
-            fputs("\(kAppName): \(shard.volume.path): FSEvents unavailable\n", stderr)
+            return true
         }
+        fputs("\(kAppName): \(shard.volume.path): FSEvents unavailable\n", stderr)
+        return false
     }
 
     private func stopWatching(_ id: String) {
@@ -293,6 +306,7 @@ final class IndexDaemon {
 
         installSignalHandlers()
         installMountObservers()
+        observeAppActivation()
 
         while true {
             let clientFD = accept(listenFD, nil, nil)
@@ -308,6 +322,8 @@ final class IndexDaemon {
 
     private func serve(_ fd: Int32) {
         defer { close(fd) }
+        // Pick up config edits even while brew services keeps the process alive.
+        reloadConfigIfChanged()
         var reader = SocketReader(fd: fd)
         while let line = reader.nextLine() {
             let parts = line.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
@@ -507,6 +523,94 @@ final class IndexDaemon {
         return true
     }
 
+    /// Re-checks the config whenever this user's GUI session becomes active.
+    /// `brew services` starts the daemon at login, often before external disks
+    /// are mounted (or before the config was edited); the next time mff is used
+    /// the daemon catches up without a restart.
+    private func observeAppActivation() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.reloadConfigIfChanged()
+            self.resumeMissingWatchers()
+        }
+    }
+
+    /// Starts FSEvents for ready shards that have no watcher yet (covers disks
+    /// mounted before the daemon and restarts that failed).
+    private func resumeMissingWatchers() {
+        lock.lock()
+        let candidates = shards.values.filter { $0.state == .ready }
+        lock.unlock()
+        for shard in candidates { startWatching(shard) }
+    }
+
+    // MARK: - Config reload
+
+    /// Re-reads `config.toml`. Returns true when the parsed values changed.
+    @discardableResult
+    private func reloadConfigIfChanged() -> Bool {
+        guard FileManager.default.fileExists(atPath: configPath) else { return false }
+        let fresh = ConfigFileLoader.load(path: configPath)
+        // Repeat the parse warnings only when something actually changed.
+        if !sameConfig(fresh, config), !fresh.warnings.isEmpty {
+            for w in fresh.warnings { fputs("\(kAppName): config \(configPath): \(w)\n", stderr) }
+        }
+        guard !sameConfig(fresh, config) else { return false }
+        fputs("\(kAppName): config changed; reloading \(configPath)\n", stderr)
+        config = fresh
+        applyConfigChanges()
+        return true
+    }
+
+    /// Compares everything that affects the daemon (warnings/UI keys do not:
+    /// they are printed once at load and would otherwise reload on every log).
+    private func sameConfig(_ a: ConfigFile, _ b: ConfigFile) -> Bool {
+        a.indexEnabled == b.indexEnabled
+            && a.indexVolumes == b.indexVolumes
+            && a.indexExternalVolumes == b.indexExternalVolumes
+            && a.indexExclude == b.indexExclude
+    }
+
+    /// Reconciles shards with the (new) config: drops volumes no longer wanted
+    /// (hidden immediately, files kept for a quick return) and starts builds for
+    /// newly wanted volumes that are mounted.
+    private func applyConfigChanges() {
+        lock.lock()
+        let wanted = IndexResolver(config: config).volumesToIndex()
+        let wantedIDs = Set(wanted.map { $0.id })
+        var dropped: [String] = []
+        for (id, shard) in shards where !wantedIDs.contains(id) {
+            shard.overlay.removeSubtree(shard.volume.path)
+            shard.state = .absent
+            dropped.append(id)
+        }
+        for id in dropped { shards.removeValue(forKey: id) }
+        shardOrder.removeAll { dropped.contains($0) }
+        var added: [VolumeInfo] = []
+        for vol in wanted where shards[vol.id] == nil {
+            let shard = VolumeShard(volume: vol, state: .building)
+            shards[vol.id] = shard
+            shardOrder.append(vol.id)
+            added.append(vol)
+        }
+        lock.unlock()
+
+        for id in dropped {
+            stopWatching(id)
+            fputs("\(kAppName): \(id): no longer indexed (config)\n", stderr)
+        }
+        resumeMissingWatchers()
+        for vol in added {
+            fputs("\(kAppName): \(vol.path): now indexed (config)\n", stderr)
+            lock.lock()
+            let shard = shards[vol.id]
+            lock.unlock()
+            if let shard { startBuild(shard) }
+        }
+    }
+
     // MARK: - Mount/unmount
 
     private func installMountObservers() {
@@ -528,13 +632,22 @@ final class IndexDaemon {
         let existing = shards[info.id]
         lock.unlock()
 
+        if let current = existing, current.state == .ready {
+            // Already serving this mount (daemon started with the disk mounted,
+            // or it was configured at startup): just resume events from the
+            // checkpoint.
+            startWatching(current)
+            return
+        }
         if existing != nil {
-            // Same volume came back: its shard is still on disk; restart serving
-            // it and replay FSEvents from the checkpoint.
-            guard let shard = reloadShard(info) else { return }
-            fputs("\(kAppName): \(path) remounted; resuming\n", stderr)
-            if shard.volume.supportsEvents { startWatching(shard) }
-        } else if allowed {
+            // The disk came back under the same id: its shard is on disk; reload
+            // it and replay FSEvents from the checkpoint instead of re-walking.
+            if let shard = reloadShard(info), startWatching(shard) || !info.supportsEvents {
+                fputs("\(kAppName): \(path) remounted; resuming\n", stderr)
+                return
+            }
+        }
+        if allowed {
             fputs("\(kAppName): \(path) mounted; building\n", stderr)
             let shard = VolumeShard(volume: info, state: .building)
             lock.lock(); shards[info.id] = shard; shardOrder.append(info.id); lock.unlock()

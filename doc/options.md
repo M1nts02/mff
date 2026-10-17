@@ -47,8 +47,7 @@ rescan everything.
 ## Subcommands
 
 ```bash
-mff config path | edit | validate | show
-mff index  rebuild [--volume PATH] | clean | stop | status
+mff index rebuild [--volume PATH] | clean | stop | status
 ```
 
 ## Keyboard
@@ -77,5 +76,16 @@ completes (descends into) the highlighted folder, `⌘1`–`⌘9` completes the 
 
 - Left: `Mark` / `Clear Marks` (multi-select, same as `⌘M` / `⌘⇧M`), then
   `Open` / `Reveal in Finder` / `Return` (same as `⌘O` / `⌘R` / `↩`).
-- Right: `⌘G` folder picker (the list goes full width and the preview is hidden
-  while picking) and, for file/content search, the file-type popup (same as `⌘T`).
+- Right: folder picker button (same as `⌘G`; the list goes full width and the
+  preview is hidden while picking) and, for file/content search, the file-type
+  popup (same as `⌘T`).
+- The menu-bar item (always present) offers **Show mff** (`⌘O`) and **Quit mff**
+  (`⌘Q`). Closing the window hides mff; switching to another app quits it.
+
+## Configuration
+
+Configuration is a plain file, `~/.config/mff/config.toml` (no subcommands):
+see [config.md](config.md) for every key and
+[../config.example.toml](../config.example.toml) for a fully annotated example.
+`--config PATH` / `$MFF_CONFIG` change the path, `--no-config` ignores it.
+Unknown keys are reported on stderr at startup.

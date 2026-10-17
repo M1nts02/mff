@@ -81,13 +81,22 @@ enum IndexManager {
     }
 
     /// Prints daemon state and the per-volume report.
-    static func status() {
+    /// `mff index status [--config PATH]`: the daemon's view when one is
+    /// running, otherwise the manifest. Also reports which configured roots are
+    /// missing from the index, which is the usual reason an external disk "is
+    /// not searchable" (config not listing it, or the daemon started before it
+    /// was mounted).
+    static func status(daemonConfig: ConfigFile?) {
+        let config = daemonConfig ?? ConfigFileLoader.load(path: ConfigFileLoader.defaultPath())
+        let wanted = IndexResolver(config: config).volumesToIndex()
         let client = IndexClient()
         if let ping = client.probe() {
             print("daemon: running (pid \(ping.pid), state \(ping.state), \(ping.count) entries)")
-            for v in client.volumes() {
+            let served = client.volumes()
+            for v in served {
                 print("  volume \(v.path) [\(v.state)] \(v.entries) entries  (\(v.id))")
             }
+            reportWanted(wanted, indexed: Set(served.map { $0.id }), running: true)
             return
         }
         print("daemon: not running")
@@ -109,6 +118,24 @@ enum IndexManager {
             print("    id: \(v.id)  fs: \(v.fs)  entries: \(v.count)")
             print("    size: \(byteString(size ?? 0))  built: \(fmt.string(from: Date(timeIntervalSince1970: v.builtAt)))")
             print("    lastEventId: \(v.lastEventID)")
+        }
+        reportWanted(wanted, indexed: Set(manifest.volumes.map { $0.id }), running: false)
+    }
+
+    /// Lists configured roots the index does not serve (and why, if the root is
+    /// not mounted right now).
+    private static func reportWanted(_ wanted: [VolumeInfo], indexed: Set<String>, running: Bool) {
+        let missing = wanted.filter { !indexed.contains($0.id) }
+        guard !missing.isEmpty else { return }
+        print(running ? "  configured but not served by the daemon:"
+                      : "  configured but not in the manifest:")
+        for vol in missing {
+            // Root paths can be subdirectories of a volume (e.g. `~`), so test
+            // the path itself rather than looking the root up as a volume.
+            var isDir: ObjCBool = false
+            let mounted = FileManager.default.fileExists(atPath: vol.path, isDirectory: &isDir)
+                && isDir.boolValue
+            print("    \(vol.path) — \(mounted ? "mounted, not indexed yet" : "not mounted")")
         }
     }
 

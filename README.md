@@ -10,7 +10,8 @@ mff ~/Music .mp3                   # find .mp3 files under ~/Music
 mff --app                          # app launcher
 mff ~/notes --content TODO         # files whose text contains "TODO"
 mff ~/Music --binary neon          # audio/video/image whose metadata matches
-mff --index-daemon &               # optional: start the resident index
+mff --index-daemon                 # optional: start the resident index
+brew services start mff            # ...or run it as a login service
 ```
 
 ## Features
@@ -22,8 +23,10 @@ mff --index-daemon &               # optional: start the resident index
 - **Preview**: Quick Look, media player with cover art, plain text for
   lyrics/subtitles; FLAC/OGG/Opus tags and MKV/WebM covers parsed natively.
 - **Optional index daemon**: per-volume, FSEvents-incremental, survives restarts
-  and disk eject; falls back to a live walk whenever unavailable.
-- Config lives entirely in `~/.config/mff/config.toml` (no GUI settings panel).
+  and disk eject, re-reads `config.toml` while running; falls back to a live walk
+  whenever unavailable.
+- Config lives entirely in `~/.config/mff/config.toml` (no GUI settings panel,
+  no subcommands): see [doc/config.md](doc/config.md).
 
 ## Documentation
 

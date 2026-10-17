@@ -1,14 +1,9 @@
 # Configuration
 
 mff reads an optional `~/.config/mff/config.toml` (a plain data file — keep it
-in dotfiles / version control). Without it, mff behaves with defaults.
-
-```bash
-mff config path       # print the config path in use
-mff config edit       # open it in $EDITOR (creates a template if missing)
-mff config validate   # check it parses (non-zero exit on unknown keys/values)
-mff config show       # print the effective parsed config
-```
+in dotfiles / version control). It is **not** created automatically: copy
+[../config.example.toml](../config.example.toml) and uncomment what you need.
+Without it, mff behaves with defaults.
 
 mff is configured **entirely from `config.toml`** — there is no settings panel,
 so the file stays the single source of truth. CLI flags override the file when
@@ -18,6 +13,9 @@ starts with the defaults.
 
 Path values (top-level `exclude`, `[index] volumes` / `external_volumes` path
 lists) accept a leading `~`, `${HOME}` or `$HOME`.
+
+Unknown keys or tables are reported on stderr when mff starts (a file with
+mistakes still loads, with the offending entry ignored).
 
 ## Exclude (all modes)
 
@@ -67,6 +65,5 @@ See [index.md](index.md).
 
 ## Example
 
-See [../config.example.toml](../config.example.toml) for a more heavily
-annotated example. `mff config edit` writes the built-in template, which has the
-same keys with shorter comments.
+See [../config.example.toml](../config.example.toml) for a fully annotated
+example covering every supported key.

@@ -18,12 +18,23 @@ daemon disappears mid-session, mff switches back to a live walk automatically
 ## Commands
 
 ```bash
-mff index status                        # daemon + per-volume state, entries, size, lastEventId
+mff index status                        # daemon + per-volume state; lists configured roots not indexed
 mff index rebuild                       # rebuild every configured volume
 mff index rebuild --volume /Volumes/X   # rebuild just that volume
 mff index stop                          # stop a running daemon (SIGTERM)
 mff index clean                         # delete all index files
 ```
+
+### Running it as a login service
+
+`brew services start mff` runs `mff --index-daemon` as a launchd job for the
+logged-in user (state and config are per-user). Two consequences:
+
+- The job starts at login, possibly **before external disks are mounted**. The
+  daemon picks them up when they mount, and also re-checks the config and
+  resumes watching on the next app switch — no restart needed.
+- Config edits made after the job started are picked up the same way; check
+  `mff index status` if a disk still does not show up.
 
 Only **one** daemon runs at a time: starting a second one detects the running
 instance (exclusive lock file) and exits immediately.
@@ -44,8 +55,8 @@ instance (exclusive lock file) and exits immediately.
   (`appVersion`). Upgrading mff therefore rebuilds the whole index on the next
   daemon start (or `index rebuild`), and `index status` shows which version
   built it and whether a rebuild is pending. On-disk layout changes are handled
-  too: a different shard `formatVersion`/magic makes the shard unreadable and it
-  is rebuilt.
+  too: a shard written with a different `formatVersion` is unreadable and is
+  rebuilt.
 - **Fallback**: if the daemon is missing or a volume is not ready, mff walks live
   instead of showing an empty list.
 
@@ -63,6 +74,13 @@ exclude = ["**/node_modules", "**/DerivedData", "**/.git"]
   walk unless also in the top-level `exclude`).
 - External volumes are **not** indexed by default; list them in
   `external_volumes` or use `all`.
+- The config is **re-read while the daemon runs**: editing `config.toml` (adding
+  a disk, changing excludes) is applied on the next daemon activity (any
+  connection — `index status`, a search) or the next app switch, with no
+  restart. Roots that are removed stop being served immediately (their shard
+  files are kept); new roots that are mounted are built in the background.
+- `index status` lists every configured root the daemon does **not** serve and
+  whether it is mounted — the quickest check when a disk is not searchable.
 - Filesystems without FSEvents (exFAT/NTFS) are still indexed but cannot be kept
   fresh live — refresh with `index rebuild`.
 - In index mode `-p/--path` does not re-walk: the index covers the configured
