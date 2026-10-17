@@ -15,12 +15,15 @@ struct AudioMetadata {
     }
 
     /// Returns `nil` when the container is unsupported or holds no metadata.
-    static func read(_ url: URL) -> AudioMetadata? {
+    /// Reads tags. `wantArtwork` is false for indexing: the embedded cover can
+    /// be several MB and reading it from a slow external disk is expensive,
+    /// while the index only needs title/artist/album.
+    static func read(_ url: URL, wantArtwork: Bool = true) -> AudioMetadata? {
         switch url.pathExtension.lowercased() {
         case "flac":
-            return readFLAC(url)
+            return readFLAC(url, wantArtwork: wantArtwork)
         case "ogg", "oga", "opus":
-            return readOgg(url)
+            return readOgg(url, wantArtwork: wantArtwork)
         default:
             return nil
         }
@@ -34,7 +37,7 @@ private extension AudioMetadata {
     /// us read a huge amount of data into memory).
     static let maxBlockSize = 64 * 1024 * 1024
 
-    static func readFLAC(_ url: URL) -> AudioMetadata? {
+    static func readFLAC(_ url: URL, wantArtwork: Bool) -> AudioMetadata? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
 
@@ -54,14 +57,19 @@ private extension AudioMetadata {
                 | Int(header[header.startIndex + 2]) << 8
                 | Int(header[header.startIndex + 3])
 
-            if (type == 4 || type == 6), length > 0, length <= maxBlockSize {
+            if type == 4, length > 0, length <= maxBlockSize {
                 let block = handle.readData(ofLength: length)
                 guard block.count == length else { break }
-                if type == 4 {
-                    parseVorbisComments(block, into: &metadata)
-                } else {
-                    metadata.artwork = pictureImageData(block)
-                }
+                parseVorbisComments(block, into: &metadata, wantArtwork: wantArtwork)
+            } else if type == 6, wantArtwork, length > 0, length <= maxBlockSize {
+                let block = handle.readData(ofLength: length)
+                guard block.count == length else { break }
+                metadata.artwork = pictureImageData(block)
+            } else if type == 6, !wantArtwork {
+                // Indexing: skip the (often multi-MB) cover. Seeking past it on
+                // a slow disk is costly and we already have the comments, which
+                // precede the picture block.
+                break
             } else if length > 0 {
                 handle.seek(toFileOffset: handle.offsetInFile + UInt64(length))
             }
@@ -76,7 +84,7 @@ private extension AudioMetadata {
 // MARK: - Ogg (Vorbis / Opus)
 
 private extension AudioMetadata {
-    static func readOgg(_ url: URL) -> AudioMetadata? {
+    static func readOgg(_ url: URL, wantArtwork: Bool) -> AudioMetadata? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
 
@@ -117,9 +125,9 @@ private extension AudioMetadata {
         var metadata = AudioMetadata()
         let vorbisMagic: [UInt8] = [0x03] + Array("vorbis".utf8)
         if commentHeader.starts(with: vorbisMagic) {
-            parseVorbisComments(commentHeader.dropFirst(vorbisMagic.count), into: &metadata)
+            parseVorbisComments(commentHeader.dropFirst(vorbisMagic.count), into: &metadata, wantArtwork: wantArtwork)
         } else if commentHeader.starts(with: Data("OpusTags".utf8)) {
-            parseVorbisComments(commentHeader.dropFirst(8), into: &metadata)
+            parseVorbisComments(commentHeader.dropFirst(8), into: &metadata, wantArtwork: wantArtwork)
         } else {
             return nil
         }
@@ -133,7 +141,8 @@ private extension AudioMetadata {
 private extension AudioMetadata {
     /// Parses a Vorbis comment block (little-endian). Used by FLAC directly and
     /// by Ogg after the codec-specific header prefix.
-    static func parseVorbisComments<S: DataProtocol>(_ data: S, into metadata: inout AudioMetadata) {
+    static func parseVorbisComments<S: DataProtocol>(_ data: S, into metadata: inout AudioMetadata,
+                                                      wantArtwork: Bool = true) {
         var reader = ByteReader(data)
         guard let vendorLength = reader.uint32LE(), reader.skip(Int(vendorLength)),
               let count = reader.uint32LE() else { return }
@@ -155,7 +164,7 @@ private extension AudioMetadata {
             case "ALBUM":
                 metadata.album = metadata.album ?? value
             case "METADATA_BLOCK_PICTURE":
-                if metadata.artwork == nil, let block = Data(base64Encoded: value) {
+                if wantArtwork, metadata.artwork == nil, let block = Data(base64Encoded: value) {
                     metadata.artwork = pictureImageData(block)
                 }
             default:

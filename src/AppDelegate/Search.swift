@@ -4,13 +4,32 @@ extension AppDelegate {
 
     // MARK: - Search
 
+    /// Debounce for ordinary (path/name) and index-backed searches: wait until
+    /// the user has stopped typing for this long before searching.
+    static let searchDebounce: TimeInterval = 0.5
+
     func scheduleSearch(_ query: String) {
         if isContentSearch {
             scheduleContentSearch()
             return
         }
+        // Periodically re-probe the daemon so it can appear/disappear without
+        // restarting mff. If it went away, reload from a live walk.
+        maybeReprobeIndex()
+        // Index mode: the daemon narrows by query, so a change to the query
+        // means a fresh fetch rather than an in-memory filter.
+        if useIndex {
+            if query != indexQuery {
+                indexQuery = query
+                searchTimer?.invalidate()
+                searchTimer = Timer.scheduledTimer(withTimeInterval: AppDelegate.searchDebounce, repeats: false) { [weak self] _ in
+                    self?.startLoadingData()
+                }
+            }
+            return
+        }
         searchTimer?.invalidate()
-        searchTimer = Timer.scheduledTimer(withTimeInterval: 0.04, repeats: false) { [weak self] _ in
+        searchTimer = Timer.scheduledTimer(withTimeInterval: AppDelegate.searchDebounce, repeats: false) { [weak self] _ in
             self?.performSearch(query)
         }
     }
@@ -31,6 +50,9 @@ extension AppDelegate {
         }
     }
 
+    /// Runs the search immediately. Called from `finishStreaming` once the
+    /// item list is complete, so its result is the final filtered set; `-1` is
+    /// honoured there (not per batch, where an unsorted early hit could win).
     func applyQuery(_ query: String) {
         searchTimer?.invalidate()
         performSearch(query)
@@ -44,7 +66,21 @@ extension AppDelegate {
 
         let generation = searchGeneration + 1
         searchGeneration = generation
-        let items = allItems
+        // Typing a few more characters only narrows the result set, so start
+        // from the previous matches instead of rescanning every item. Items
+        // that were filtered out can never match a longer query, so they are
+        // skipped; the surviving ones are re-matched to refresh scores and
+        // highlight positions.
+        let reusable: [MatchResult]
+        if FuzzyMatcher.canNarrow(from: lastQuery, to: query) {
+            reusable = filteredMatches
+        } else {
+            reusable = []
+        }
+        // Enumerated so ties keep the previous (or original) order.
+        let candidates: [(SearchableItem, Int)] = reusable.isEmpty
+            ? allItems.enumerated().map { ($0.element, $0.offset) }
+            : reusable.enumerated().map { ($0.element.item, $0.offset) }
         // App search matches only the app name; everything else matches the
         // whole path.
         let matchPath = !isAppSearch
@@ -52,10 +88,10 @@ extension AppDelegate {
         DispatchQueue.global(qos: .userInitiated).async {
             var results: [MatchResult]
             if query.isEmpty {
-                results = items.map { MatchResult(item: $0, score: 0, termPositions: []) }
+                results = candidates.map { MatchResult(item: $0.0, score: 0, termPositions: []) }
             } else {
-                let matched = items.compactMap {
-                    FuzzyMatcher.match(query: query, in: $0, matchPath: matchPath)
+                let matched = candidates.compactMap { pair -> MatchResult? in
+                    FuzzyMatcher.match(query: query, in: pair.0, matchPath: matchPath)
                 }
                 let indexed = matched.enumerated().sorted { a, b in
                     if a.element.score != b.element.score {
@@ -69,6 +105,7 @@ extension AppDelegate {
             DispatchQueue.main.async {
                 guard generation == self.searchGeneration else { return }
                 self.filteredMatches = results
+                self.lastQuery = query
                 self.tableView.reloadData()
                 if !results.isEmpty {
                     self.selectRow(0)
@@ -76,13 +113,26 @@ extension AppDelegate {
                     self.clearSelection()
                 }
                 self.updateFooter()
-
-                if self.config.autoSelectSingle && !self.isStreaming && results.count == 1 {
-                    self.selectCurrent()
-                }
+                // Interactive (typed) search: honour -1 on the final result,
+                // and -m (print the query) when nothing matches.
+                if !self.isStreaming { self.finishPlainSearch(query, results: results) }
             }
         }
     }
+    /// Finishes a plain (non-content) search whose result set is final.
+    ///
+    /// With several matches only the selection is refreshed: the user may type
+    /// on, and `-1` must not fire and quit in the middle of a search (neither
+    /// when a streamed index result happens to be a single hit).
+    func finishPlainSearch(_ query: String, results: [MatchResult]) {
+        if results.count == 1, config.autoSelectSingle {
+            selectCurrent()
+        } else if results.isEmpty, config.returnQueryOnMismatch {
+            writeOutput(query)
+            exit(1)
+        }
+    }
+
     // MARK: - Highlighting
 
     /// One highlight colour per search term, so terms can be told apart.
@@ -138,5 +188,20 @@ extension AppDelegate {
             }
         }
         return attr
+    }
+
+    /// Re-probes the daemon at most once every few seconds. Losing the daemon
+    /// switches this run back to a live walk (and reloads the list).
+    func maybeReprobeIndex() {
+        guard wantsIndex else { return }
+        let now = Date()
+        if let last = lastIndexProbe, now.timeIntervalSince(last) < 5 { return }
+        lastIndexProbe = now
+        let was = useIndex
+        refreshIndexAvailability()
+        if was && !useIndex {
+            indexQuery = ""
+            startLoadingData()
+        }
     }
 }

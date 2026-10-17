@@ -75,6 +75,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     lazy var tagFieldEditor: NSTextView = makeTagFieldEditor()
     var previewedURL: URL?
     var artworkToken = 0
+    /// Index use (v3): true when a plain file search should stream from the
+    /// daemon instead of walking the filesystem.
+    var useIndex = false
+    /// Last time the daemon was probed (throttles re-probing).
+    var lastIndexProbe: Date?
+    /// Query the current `filteredMatches` were produced for, so a longer
+    /// query can narrow from them instead of rescanning every item.
+    var lastQuery = ""
+    /// Content mode + index: items come from the index (audio metadata attached)
+    /// and text contents are read lazily during matching.
+    var contentFromIndex = false
+    /// The query the current index result set was fetched for, so a query change
+    /// re-queries the daemon.
+    var indexQuery = ""
+    /// Global hotkey (from `[ui] keybinding`) and the menu-bar status item that
+    /// keeps mff resident so the hotkey stays live.
+    var hotKey: HotKey?
+    var statusItem: NSStatusItem?
 
     // Layout constants
     let searchHeight: CGFloat = 56
@@ -94,14 +112,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         ("Folders", .folder)
     ]
 
-    var isFileSearch: Bool { config.mode == .files || config.mode == .content }
-    var isContentSearch: Bool { config.mode == .content }
+    /// Whether this run may use the index daemon at all (file search, enabled
+    /// in config, not --no-index).
+    var wantsIndex: Bool {
+        config.mode == .files && !config.noIndex && config.file.indexEnabled
+    }
+
+    /// (Re)probes the daemon. Unlike the initial check this can also turn the
+    /// index **off** when the daemon has gone away, so searches fall back to a
+    /// live walk instead of returning nothing.
+    func refreshIndexAvailability() {
+        guard wantsIndex else { useIndex = false; return }
+        useIndex = IndexClient().probe() != nil
+    }
+
+    var isFileSearch: Bool { config.mode == .files }
+    /// Content modifiers (`--content` / `--binary`) layer onto a file search or
+    /// `--stdin-files`; they are not a mode of their own.
+    var isContentSearch: Bool { config.searchTextContent || config.searchBinary }
     var isAppSearch: Bool { config.mode == .apps }
     var isStdin: Bool { config.mode == .stdin }
     /// Modes whose items are real filesystem URLs, so Quick Look previews,
     /// icons, drag-out and Open / Reveal all make sense.
     var isFileLike: Bool {
-        config.mode == .files || config.mode == .content || config.mode == .stdinFiles
+        config.mode == .files || config.mode == .stdinFiles
     }
     var showsPreview: Bool {
         // App search is a compact launcher; it does not need a preview pane.
@@ -128,6 +162,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // MARK: - Application lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Apply configured icon overrides before any icon is drawn.
+        IconCache.shared.overrides = config.file.icons
         setupMenu()
         setupWindow()
         setupSearchField()
@@ -138,6 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         installKeyMonitor()
         installClickMonitor()
         installFocusObserver()
+        setupHotKey()
+        // Always keep a menu-bar item: it is the grab handle and "Quit mff"
+        // escape hatch for a window that got hidden or opened without focus
+        // (e.g. right after a rebuild on a slow volume). With a keybinding it
+        // also keeps mff resident.
+        setupStatusItem()
 
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -151,8 +193,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             applyQueryTags()
         }
 
+        // Decide whether to use the index daemon: only for filesystem search
+        // (--stdin files paths come from stdin, so no index). --content alone
+        // (text only) never uses the index; --binary can. Also requires config
+        // enabled + not --no-index + a daemon replying on the socket.
+        if wantsIndex {
+            refreshIndexAvailability()
+            if useIndex {
+                indexQuery = config.initialQuery
+                // Indexed candidates are used only to seed a content search
+                // when the binary dimension is on.
+                contentFromIndex = config.searchBinary
+            }
+        }
+
         startLoadingData()
         updateFooter()
+    }
+
+    // MARK: - Global hotkey / menu bar (v2)
+
+    /// Installs the `[ui] keybinding` global hotkey (a no-op without one). The
+    /// menu-bar item is created separately and unconditionally in
+    /// `applicationDidFinishLaunching`; with a hotkey it also keeps mff resident
+    /// while the window is hidden.
+    func setupHotKey() {
+        guard let spec = config.keybinding else { return }
+        hotKey = HotKey(spec: spec) { [weak self] in
+            self?.toggleWindow()
+        }
+        if hotKey == nil {
+            fputs("\(kAppName): keybinding '\(spec)' is invalid or already taken\n", stderr)
+        }
+    }
+
+    func setupStatusItem() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "magnifyingglass",
+                                     accessibilityDescription: "mff")
+        let menu = NSMenu()
+        let show = NSMenuItem(title: "Show mff", action: #selector(showWindow), keyEquivalent: "o")
+        show.keyEquivalentModifierMask = .command
+        show.target = self
+        menu.addItem(show)
+        if let spec = config.keybinding {
+            let hint = NSMenuItem(title: "Hotkey: \(spec)", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
+            menu.addItem(.separator())
+        }
+        let quit = NSMenuItem(title: "Quit mff", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
+        item.menu = menu
+        statusItem = item
+    }
+
+    @objc func showWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(searchField)
+    }
+
+    /// Hotkey behaviour: hide the window if it is frontmost and key, otherwise
+    /// bring it up and focus the search field.
+    func toggleWindow() {
+        if window.isVisible && window.isKeyWindow {
+            window.orderOut(nil)
+        } else {
+            showWindow()
+        }
+    }
+
+    /// When a keybinding keeps mff resident, closing the window hides it rather
+    /// than quitting, so the hotkey stays available.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // The menu-bar item always exists, so closing hides the window (the
+        // item's Quit command is the way out) instead of quitting.
+        window.orderOut(nil)
+        return false
     }
 
     /// Invisible menu bar so Cmd+C/X/V/A/Z work inside the search field.
@@ -261,7 +379,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         searchField.drawsBackground = false
         searchField.isBezeled = false
         searchField.isBordered = false
-        searchField.placeholderString = isContentSearch ? "Search file contents"
+        searchField.placeholderString = isContentSearch
+            ? (config.searchBinary && !config.searchTextContent ? "Search binary content"
+               : (config.searchTextContent && !config.searchBinary ? "Search file contents"
+                  : "Search text & binary content"))
             : (isFileLike ? "Search files" : (isAppSearch ? "Search apps" : "Search"))
         searchField.autoresizingMask = [.width]
 
@@ -590,28 +711,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let source: ItemSource
         switch config.mode {
         case .stdin:
+            // --content/--binary can't apply to raw stdin lines (validated in
+            // parseArguments), so this is always plain lines.
             source = StdinSource(kind: .lines)
         case .stdinFiles:
+            // Paths come from stdin; with --content/--binary the content search
+            // reads their text/metadata live (no index).
             source = StdinSource(
                 kind: .files,
                 typeFilter: config.typeFilter,
-                namePattern: config.namePattern
+                namePattern: config.namePattern,
+                exclude: config.excludePatterns
             )
         case .files:
-            source = FileSource(
-                paths: config.searchPaths,
-                typeFilter: config.typeFilter,
-                namePattern: config.namePattern,
-                includeHidden: config.includeHidden
-            )
-        case .content:
-            source = ContentSource(
-                paths: config.searchPaths,
-                typeFilter: config.typeFilter,
-                namePattern: config.namePattern,
-                includeHidden: config.includeHidden,
-                maxFileSize: config.maxFileSize
-            )
+            // Content modifiers layer onto the file search.
+            if isContentSearch {
+                if useIndex {
+                    // The daemon supplies candidates (paths + binary metadata,
+                    // prefix-filtered). Text contents are read live during
+                    // matching; if no daemon, ContentSource walks instead.
+                    source = IndexSource(
+                        query: "",
+                        prefixes: config.searchPaths,
+                        excludes: config.excludePatterns,
+                        content: true,
+                        typeFilter: config.typeFilter,
+                        namePattern: config.namePattern
+                    )
+                } else {
+                    source = ContentSource(
+                        paths: config.searchPaths,
+                        typeFilter: config.typeFilter,
+                        namePattern: config.namePattern,
+                        includeHidden: config.includeHidden,
+                        maxFileSize: config.maxFileSize,
+                        readText: config.searchTextContent,
+                        readBinary: config.searchBinary,
+                        exclude: config.excludePatterns
+                    )
+                }
+            } else if useIndex {
+                // Plain name search, served by the index.
+                source = IndexSource(
+                    query: searchField.stringValue,
+                    prefixes: config.searchPaths,
+                    excludes: config.excludePatterns,
+                    content: false,
+                    typeFilter: config.typeFilter,
+                    namePattern: config.namePattern
+                )
+            } else {
+                source = FileSource(
+                    paths: config.searchPaths,
+                    typeFilter: config.typeFilter,
+                    namePattern: config.namePattern,
+                    includeHidden: config.includeHidden,
+                    exclude: config.excludePatterns
+                )
+            }
         case .apps:
             source = AppSource()
         }
@@ -630,6 +787,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         contentCandidates = []
         contentCursor = 0
         lastContentQuery = ""
+        // A (re)load invalidates any saved result set: the item list is about to
+        // change, so narrowing from `filteredMatches` would be wrong.
+        lastQuery = ""
+        filteredMatches.removeAll()
+        // Index mode re-fetches per query, so each load replaces (not appends to)
+        // the result set; the daemon already narrowed to the query.
+        if useIndex {
+            allItems.removeAll()
+            filteredMatches.removeAll()
+            tableView.reloadData()
+        }
         updateFooter()
 
         // Re-run the (debounced) content search over the reloaded list.
@@ -652,16 +820,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func appendItems(_ items: [SearchableItem]) {
         allItems.append(contentsOf: items)
 
-        if searchField.stringValue.isEmpty {
-            filteredMatches.append(contentsOf: items.map { MatchResult(item: $0, score: 0, termPositions: []) })
-            scheduleReload()
-        } else if isContentSearch {
-            // Always keep new files available as candidates; nothing is matched
-            // while typing, so only schedule once the debounced search runs.
+        if isContentSearch {
+            // Content mode always goes through the (incremental) content search,
+            // whether items came from a walk or the index — text contents are
+            // read live either way.
             contentCandidates.append(contentsOf: items)
             if contentSearchActive {
                 scheduleContentMatch()
             }
+        } else if searchField.stringValue.isEmpty {
+            filteredMatches.append(contentsOf: items.map { MatchResult(item: $0, score: 0, termPositions: []) })
+            scheduleReload()
         } else {
             scheduleSearch(searchField.stringValue)
         }
@@ -674,12 +843,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if contentSearchActive {
                 matchPendingContent()
                 finalizeContentSearchIfIdle()
-            } else if searchField.stringValue.isEmpty {
-                // Plain file list (no query): honour -1 directly.
-                autoSelectIfSingle()
+            } else {
+                applyQuery(searchField.stringValue)
             }
         } else {
             applyQuery(searchField.stringValue)
+        }
+        // The result set is final now, so `-1` can act on it (per batch would
+        // pick whichever unsorted hit streamed in first). Content mode finishes
+        // synchronously above (and checks again when its last pass drains);
+        // plain mode settles inside `finishPlainSearch`.
+        if isContentSearch {
+            autoSelectIfSingle()
+        } else {
+            finishPlainSearch(searchField.stringValue, results: filteredMatches)
         }
         updateFooter()
     }
@@ -712,7 +889,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         } else {
             switch config.mode {
             case .files: text = "\(total) files"
-            case .content: text = "\(total) files"
             case .stdinFiles: text = "\(total) files"
             case .apps: text = "\(total) apps"
             case .stdin: text = "\(total) lines"
@@ -752,7 +928,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard isFileLike, !isEditingPath else { return nil }
         guard filteredMatches.indices.contains(row) else { return nil }
-        guard let url = filteredMatches[row].item.url else { return nil }
+        guard let url = filteredMatches[row].item.resolvedURL else { return nil }
         return url as NSURL
     }
 
@@ -764,7 +940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         guard isFileLike, !isEditingPath, multiSelection.count > 1 else { return }
         guard !rowIndexes.intersection(IndexSet(multiSelection)).isEmpty else { return }
 
-        let urls = multiSelection.sorted().compactMap { itemForRow($0)?.url }
+        let urls = multiSelection.sorted().compactMap { itemForRow($0)?.resolvedURL }
         guard urls.count > 1 else { return }
 
         let pasteboard = session.draggingPasteboard
@@ -833,7 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             numberLabel.widthAnchor.constraint(equalToConstant: 16)
         ])
 
-        let hasIcon = config.showIcons && item.url != nil
+        let hasIcon = config.showIcons && item.resolvedURL != nil
 
         if hasIcon {
             let iconView = NSImageView()
@@ -904,6 +1080,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
         applyQueryTags()
+        config.initialQuery = searchField.stringValue
         scheduleSearch(searchField.stringValue)
     }
 }

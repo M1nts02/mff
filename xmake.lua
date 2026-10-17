@@ -1,5 +1,5 @@
 set_project("mff")
-set_version("0.0.5")
+set_version("0.0.6")
 set_xmakever("2.8.0")
 
 add_rules("mode.debug", "mode.release")
@@ -12,5 +12,5 @@ set_config("target_minver", "13.0")
 
 target("mff")
     set_kind("binary")
-    add_files("src/*.swift", "src/AppDelegate/*.swift")
-    add_frameworks("Cocoa", "Quartz", "UniformTypeIdentifiers", "QuickLookUI", "AVKit", "AVFoundation")
+    add_files("src/*.swift", "src/AppDelegate/*.swift", "src/Index/*.swift")
+    add_frameworks("Cocoa", "Quartz", "UniformTypeIdentifiers", "QuickLookUI", "AVKit", "AVFoundation", "Carbon", "ImageIO", "CoreServices", "PDFKit")

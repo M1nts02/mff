@@ -9,6 +9,7 @@ enum FileIndexer {
         typeFilter: TypeFilter,
         namePattern: String?,
         includeHidden: Bool,
+        exclude: [String] = [],
         onBatch: @escaping @MainActor ([SearchableItem]) -> Void,
         onComplete: @escaping @MainActor () -> Void
     ) {
@@ -22,6 +23,7 @@ enum FileIndexer {
                 options.insert(.skipsHiddenFiles)
             }
 
+            let matcher = exclude.isEmpty ? nil : ExcludeMatcher(patterns: exclude)
             let loweredName = namePattern?.lowercased()
             var batch: [SearchableItem] = []
             batch.reserveCapacity(256)
@@ -35,6 +37,14 @@ enum FileIndexer {
                 ) else { continue }
 
                 while let fileURL = enumerator.nextObject() as? URL {
+                    let itemPath = fileURL.path
+                    // Skip excluded paths (and their whole subtree for dirs).
+                    if let matcher, matcher.matches(itemPath) {
+                        if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                            enumerator.skipDescendants()
+                        }
+                        continue
+                    }
                     guard let values = try? fileURL.resourceValues(forKeys: keys) else { continue }
 
                     let isDir = values.isDirectory ?? false

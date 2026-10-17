@@ -166,13 +166,15 @@ enum FuzzyMatcher {
     /// name; `!` negates both sources. When a term matches the path/name its
     /// positions are returned so the row can highlight it; content-only matches
     /// contribute no name/path highlights.
-    static func matchContent(query: String, in item: SearchableItem) -> MatchResult? {
+    static func matchContent(query: String, in item: SearchableItem,
+                             searchText: Bool = true, searchBinary: Bool = true) -> MatchResult? {
         let tokens = tokenize(query)
         if tokens.isEmpty {
             return MatchResult(item: item, score: 0, termPositions: [])
         }
 
-        let content = item.content ?? ""
+        let content = searchText ? (item.content ?? "") : ""
+        let meta = searchBinary ? (item.binaryText ?? "") : ""
         let target = Array(item.lowerSearch)
         let nameStart = max(0, item.lowerSearch.count - item.lowerDisplay.count)
         var total = 0
@@ -251,20 +253,25 @@ enum FuzzyMatcher {
                 : fuzzy(t, in: target)
 
             // Path/name matches take priority: only fall back to searching the
-            // contents when the term did not match the path. A content search
-            // stops at the first hit and marks the term as satisfied.
+            // contents / metadata when the term did not match the path. A
+            // content search stops at the first hit and marks the term as
+            // satisfied.
+            let contentHit = content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive])
+            let metaHit = meta.isEmpty ? nil
+                : meta.range(of: text, options: [.caseInsensitive, .diacriticInsensitive])
             if negate {
                 if pathResult != nil { return nil }
-                if content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
-                    return nil
-                }
+                if contentHit != nil || metaHit != nil { return nil }
             } else if let pr = pathResult {
                 total += pr.score
                 termPositions.append(pr.positions)
-            } else if let contentHit = content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive]) {
-                // Earlier content matches rank a little higher; bounded so the
-                // score stays cheap to compute on large contents.
-                let offset = content.distance(from: content.startIndex, to: contentHit.lowerBound)
+            } else if contentHit != nil || metaHit != nil {
+                // Earlier matches rank a little higher; bounded so the score
+                // stays cheap to compute on large contents. Use whichever
+                // source matched for the offset.
+                let source = contentHit != nil ? content : meta
+                let hit = contentHit ?? metaHit!
+                let offset = source.distance(from: source.startIndex, to: hit.lowerBound)
                 total += 120 + max(0, 60 - min(offset / 32, 60))
                 termPositions.append([])
             } else {

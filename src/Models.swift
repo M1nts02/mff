@@ -117,6 +117,12 @@ struct TypeFilter {
     var isEmpty: Bool { extensions.isEmpty && categories.isEmpty }
 
     func matches(url: URL, ext: String, isDirectory: Bool) -> Bool {
+        matches(path: url.path, ext: ext, isDirectory: isDirectory)
+    }
+
+    /// Path-based form used on hot paths (index hits) where no `URL` exists.
+    /// `ext` is the extension without the dot (any case).
+    func matches(path: String, ext: String, isDirectory: Bool) -> Bool {
         if isEmpty { return true }
         let e = ext.lowercased()
 
@@ -129,7 +135,7 @@ struct TypeFilter {
         }
         // multi-part extensions such as "tar.gz"
         if !extensions.isEmpty {
-            let lowerPath = url.path.lowercased()
+            let lowerPath = path.lowercased()
             for token in extensions where token.contains(".") {
                 if lowerPath.hasSuffix("." + token) { return true }
             }
@@ -157,8 +163,15 @@ struct SearchableItem {
     let lowerDisplay: String   // lowercased display name (default name search)
     let fileExtension: String  // lowercased extension without the dot ("" if none)
     /// Text contents for content-search mode (capped size); nil in every other
-    /// mode so plain file search never pays for reading files.
+    /// mode so plain file search never pays for reading files. Only used when
+    /// `--content` (text search) is on.
     let content: String?
+    /// Binary-file content text (currently audio metadata) for `--binary`
+    /// from the index when available, or is parsed live otherwise.
+    let binaryText: String?
+    /// Whether the file was classified binary at index time (content mode).
+    /// When true, its text is never read for content matching.
+    let indexBinary: Bool
 
     private static var idCounter = 0
     private static let idLock = NSLock()
@@ -182,9 +195,12 @@ struct SearchableItem {
         self.lowerDisplay = self.lowerSearch
         self.fileExtension = ""
         self.content = nil
+        self.binaryText = nil
+        self.indexBinary = false
     }
 
-    init(url: URL, isDirectory: Bool, content: String? = nil) {
+    init(url: URL, isDirectory: Bool, content: String? = nil,
+         binaryText: String? = nil, indexBinary: Bool = false) {
         self.id = Self.nextID()
         self.raw = url.path
         let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
@@ -196,6 +212,72 @@ struct SearchableItem {
         self.lowerDisplay = name.lowercased()
         self.fileExtension = url.pathExtension.lowercased()
         self.content = content
+        self.binaryText = binaryText
+        self.indexBinary = indexBinary
+    }
+
+    /// Builds an item straight from a path string, skipping `URL` entirely.
+    /// Used by index hits: `String(describing: URL)` costs ~3x the rest of the
+    /// item and `URL.fileURLWithPath` is only needed for Quick Look / icons,
+    /// which `SearchableItem.resolvedURL` creates on demand.
+    init(indexPath path: String, isDirectory: Bool, binaryText: String?,
+         indexBinary: Bool, content: String? = nil) {
+        self.id = Self.nextID()
+        self.raw = path
+        let name = (path as NSString).lastPathComponent
+        self.displayName = name.isEmpty ? path : name
+        self.parentPath = (path as NSString).deletingLastPathComponent
+        self.url = nil
+        self.isDirectory = isDirectory
+        self.lowerSearch = path.lowercased()
+        self.lowerDisplay = self.displayName.lowercased()
+        self.fileExtension = (name as NSString).pathExtension.lowercased()
+        self.content = content
+        self.binaryText = binaryText
+        self.indexBinary = indexBinary
+    }
+
+    /// The file URL, built on demand for items that were created from an index
+    /// path without one. Hot paths (matching, filtering) use `raw` / lowercase
+    /// fields and never touch this.
+    var resolvedURL: URL? {
+        url ?? (raw.hasPrefix("/") ? URL(fileURLWithPath: raw) : nil)
+    }
+
+    /// A copy with `content` filled in. Used to attach text contents lazily
+    /// during content matching when the item came from the index (which stores
+    /// binary content but not text contents).
+    func withContent(_ content: String?) -> SearchableItem {
+        SearchableItem(id: id, raw: raw, displayName: displayName, parentPath: parentPath,
+                       url: url, isDirectory: isDirectory, lowerSearch: lowerSearch,
+                       lowerDisplay: lowerDisplay, fileExtension: fileExtension,
+                       content: content, binaryText: binaryText, indexBinary: indexBinary)
+    }
+
+    /// A copy with `binaryText` filled in (lazy audio-metadata parse when the
+    /// index did not supply it).
+    func withBinaryText(_ binaryText: String?) -> SearchableItem {
+        SearchableItem(id: id, raw: raw, displayName: displayName, parentPath: parentPath,
+                       url: url, isDirectory: isDirectory, lowerSearch: lowerSearch,
+                       lowerDisplay: lowerDisplay, fileExtension: fileExtension,
+                       content: content, binaryText: binaryText, indexBinary: indexBinary)
+    }
+
+    private init(id: Int, raw: String, displayName: String, parentPath: String, url: URL?,
+                 isDirectory: Bool, lowerSearch: String, lowerDisplay: String,
+                 fileExtension: String, content: String?, binaryText: String?, indexBinary: Bool) {
+        self.id = id
+        self.raw = raw
+        self.displayName = displayName
+        self.parentPath = parentPath
+        self.url = url
+        self.isDirectory = isDirectory
+        self.lowerSearch = lowerSearch
+        self.lowerDisplay = lowerDisplay
+        self.fileExtension = fileExtension
+        self.content = content
+        self.binaryText = binaryText
+        self.indexBinary = indexBinary
     }
 }
 
@@ -213,9 +295,12 @@ final class IconCache {
     static let shared = IconCache()
     private let cache = NSCache<NSString, NSImage>()
     private let size: CGFloat = 20
+    /// `[icons.overrides]` from config.toml: extension -> app name / bundle id /
+    /// path whose icon to use instead of the file's own.
+    var overrides: [String: String] = [:]
 
     func icon(for item: SearchableItem) -> NSImage? {
-        guard let url = item.url else { return nil }
+        guard let url = item.resolvedURL else { return nil }
         let ext = url.pathExtension.lowercased()
         // Application bundles get their real icon so --app looks like Launchpad.
         let isBundle = item.isDirectory && FileTypeRegistry.appExts.contains(ext)
@@ -242,12 +327,29 @@ final class IconCache {
     }
 
     private func makeIcon(url: URL, isDirectory: Bool, ext: String) -> NSImage {
+        // A configured override wins: the value may be an app name, a bundle
+        // identifier, or an absolute path to an .app / icon source.
+        if !ext.isEmpty, let override = overrides[ext] {
+            if let image = overrideIcon(override) { return image }
+        }
         if !ext.isEmpty, let type = UTType(filenameExtension: ext) {
             return NSWorkspace.shared.icon(for: type)
         }
         return isDirectory
             ? NSWorkspace.shared.icon(for: .folder)
             : NSWorkspace.shared.icon(for: .data)
+    }
+
+    /// Resolves an override value to an icon: an absolute path (used directly),
+    /// or an application looked up via Launch Services by name / bundle id.
+    private func overrideIcon(_ value: String) -> NSImage? {
+        if value.hasPrefix("/") {
+            return NSWorkspace.shared.icon(forFile: value)
+        }
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: value) {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+        return NSWorkspace.shared.icon(forFile: "/Applications/\(value).app")
     }
 
     private func resized(_ image: NSImage, to size: CGFloat) -> NSImage {

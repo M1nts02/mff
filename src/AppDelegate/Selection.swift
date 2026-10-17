@@ -199,7 +199,7 @@ extension AppDelegate {
     /// file types opens correctly (images in Preview, audio in Music, etc.).
     func openItems(_ items: [SearchableItem]) {
         for item in items {
-            if let url = item.url {
+            if let url = item.resolvedURL {
                 NSWorkspace.shared.open(url)
             } else {
                 emit(item)
@@ -228,7 +228,7 @@ extension AppDelegate {
     /// Applies the configured Enter behaviour; for `path` it prints the item.
     /// Items without a URL (stdin lines) always print.
     func performEnter(on item: SearchableItem) {
-        if let url = item.url {
+        if let url = item.resolvedURL {
             switch config.enterAction {
             case .open:
                 NSWorkspace.shared.open(url)
@@ -244,6 +244,9 @@ extension AppDelegate {
     }
 
     func selectCurrent() {
+        // While the list is still streaming, an Enter (or -1's auto-select)
+        // could accept from a partial list — a single wrong early hit. Wait
+        // until every item has arrived.
         let items = selectedRows().compactMap { itemForRow($0) }
         guard !items.isEmpty else {
             if config.returnQueryOnMismatch {
@@ -262,7 +265,7 @@ extension AppDelegate {
 
     /// Cmd+O: open the selected file(s) with their default applications.
     func openSelectedFile() {
-        let urls = selectedRows().compactMap { itemForRow($0) }.compactMap { $0.url }
+        let urls = selectedRows().compactMap { itemForRow($0) }.compactMap { $0.resolvedURL }
         guard !urls.isEmpty else { return }
         for url in urls { NSWorkspace.shared.open(url) }
         exit(0)
@@ -281,7 +284,7 @@ extension AppDelegate {
             return
         }
         guard let item = selectedRows().compactMap({ itemForRow($0) }).first,
-              let url = item.url else { return }
+              let url = item.resolvedURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([url])
         exit(0)
     }

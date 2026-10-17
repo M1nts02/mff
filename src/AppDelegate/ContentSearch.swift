@@ -113,8 +113,32 @@ extension AppDelegate {
                 }
             }
 
-            for item in slice {
-                if let match = FuzzyMatcher.matchContent(query: query, in: item) {
+            let maxSize = self?.config.maxFileSize ?? 0
+            let searchText = self?.config.searchTextContent ?? true
+            let searchBinary = self?.config.searchBinary ?? true
+            for raw in slice {
+                var item = raw
+                guard let self else { continue }
+                // Items streamed from the index carry binary content but no text
+                // contents; read the text lazily here (grep-style) for regular
+                // non-audio files when text search is on.
+                if searchText, item.content == nil, let url = item.resolvedURL,
+                   !item.isDirectory, !item.indexBinary {
+                    let ext = url.pathExtension
+                    if FileTypeRegistry.category(for: ext) != .audio
+                        && !FileTypeRegistry.isLikelyBinary(ext: ext) {
+                        let limit = maxSize > 0 ? maxSize : Int.max
+                        item = item.withContent(ContentIndexer.readTextContent(url: url, maxBytes: limit))
+                    }
+                }
+                // Parse binary content live when not supplied by the index
+                // (no daemon / --no-index).
+                if searchBinary, item.binaryText == nil, let url = item.resolvedURL, !item.isDirectory {
+                    let category = FileTypeRegistry.category(for: url.pathExtension)
+                    item = item.withBinaryText(MediaMetadata.searchableText(for: url, category: category))
+                }
+                if let match = FuzzyMatcher.matchContent(query: query, in: item,
+                                                         searchText: searchText, searchBinary: searchBinary) {
                     pending.append(match)
                     if pending.count >= 64 { flush() }
                 }

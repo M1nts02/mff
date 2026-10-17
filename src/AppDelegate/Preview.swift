@@ -19,7 +19,7 @@ extension AppDelegate {
     func updatePreview() {
         guard showsPreview, !isEditingPath, let previewView, let playerView else { return }
 
-        guard let item = selectedItem(), let url = item.url else {
+        guard let item = selectedItem(), let url = item.resolvedURL else {
             previewedURL = nil
             stopPlayer()
             artworkView?.isHidden = true
@@ -90,7 +90,7 @@ extension AppDelegate {
 
     /// Lyrics / subtitle formats, previewed as plain text.
     func isLyricsOrSubtitle(_ item: SearchableItem) -> Bool {
-        guard !item.isDirectory, let url = item.url else { return false }
+        guard !item.isDirectory, let url = item.resolvedURL else { return false }
         return FileTypeRegistry.lyricsSubtitleExts.contains(url.pathExtension.lowercased())
     }
 
@@ -208,7 +208,7 @@ extension AppDelegate {
     }
 
     func loadArtwork(for item: SearchableItem) {
-        guard let url = item.url else { return }
+        guard let url = item.resolvedURL else { return }
         artworkToken += 1
         let token = artworkToken
 
@@ -241,7 +241,7 @@ extension AppDelegate {
     /// contents were never searched.
     func renderAudioMetadata() {
         guard let item = selectedItem(), isAudio(item), let metadata = audioMetadata else { return }
-        let title = metadata.title ?? item.url?.deletingPathExtension().lastPathComponent ?? ""
+        let title = metadata.title ?? item.resolvedURL?.deletingPathExtension().lastPathComponent ?? ""
         let artist = metadata.artist ?? ""
         let album = metadata.album ?? ""
 
@@ -338,18 +338,18 @@ extension AppDelegate {
     }
 
     func isAudio(_ item: SearchableItem) -> Bool {
-        guard !item.isDirectory, let url = item.url else { return false }
+        guard !item.isDirectory, let url = item.resolvedURL else { return false }
         return FileTypeRegistry.audioExts.contains(url.pathExtension.lowercased())
     }
 
     func isVideo(_ item: SearchableItem) -> Bool {
-        guard !item.isDirectory, let url = item.url else { return false }
+        guard !item.isDirectory, let url = item.resolvedURL else { return false }
         return FileTypeRegistry.videoExts.contains(url.pathExtension.lowercased())
     }
 
     /// Matroska / WebM containers, whose cover image (if any) we read ourselves.
     func isMatroskaVideo(_ item: SearchableItem) -> Bool {
-        guard !item.isDirectory, let url = item.url else { return false }
+        guard !item.isDirectory, let url = item.resolvedURL else { return false }
         return ["mkv", "webm"].contains(url.pathExtension.lowercased())
     }
 

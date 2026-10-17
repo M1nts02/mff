@@ -26,6 +26,9 @@ enum ContentIndexer {
         namePattern: String?,
         includeHidden: Bool,
         maxFileSize: Int,
+        readText: Bool,
+        readBinary: Bool,
+        exclude: [String] = [],
         onBatch: @escaping @MainActor ([SearchableItem]) -> Void,
         onComplete: @escaping @MainActor () -> Void
     ) {
@@ -40,6 +43,7 @@ enum ContentIndexer {
                 options.insert(.skipsHiddenFiles)
             }
 
+            let matcher = exclude.isEmpty ? nil : ExcludeMatcher(patterns: exclude)
             let loweredName = namePattern?.lowercased()
             var batch: [SearchableItem] = []
             batch.reserveCapacity(128)
@@ -53,6 +57,13 @@ enum ContentIndexer {
                 ) else { continue }
 
                 while let fileURL = enumerator.nextObject() as? URL {
+                    // Skip excluded paths (and their whole subtree for dirs).
+                    if let matcher, matcher.matches(fileURL.path) {
+                        if (try? fileURL.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                            enumerator.skipDescendants()
+                        }
+                        continue
+                    }
                     guard let values = try? fileURL.resourceValues(forKeys: keys) else { continue }
 
                     let isDir = values.isDirectory ?? false
@@ -78,22 +89,25 @@ enum ContentIndexer {
                     // "Skipping" only means skipping the raw *contents*: files
                     // are still listed so they can match by name/path.
                     let ext = fileURL.pathExtension
-                    let category = FileTypeRegistry.category(for: ext)
-                    let content: String?
-                    if category == .audio {
-                        // Only audio metadata is searchable (title / artist /
-                        // album); video and images are name-only.
-                        content = MediaMetadata.searchableText(for: fileURL, category: category)
-                    } else if maxFileSize > 0, (values.fileSize ?? 0) > maxFileSize {
-                        content = nil
-                    } else if FileTypeRegistry.isLikelyBinary(ext: ext) {
-                        content = nil
-                    } else {
-                        let readLimit = maxFileSize > 0 ? maxFileSize : Int.max
-                        content = readTextContent(url: fileURL, maxBytes: readLimit)
+                    var content: String?
+                    var binaryText: String?
+                    if readText {
+                        if maxFileSize > 0, (values.fileSize ?? 0) > maxFileSize {
+                            content = nil
+                        } else if FileTypeRegistry.isLikelyBinary(ext: ext) {
+                            content = nil
+                        } else {
+                            let readLimit = maxFileSize > 0 ? maxFileSize : Int.max
+                            content = readTextContent(url: fileURL, maxBytes: readLimit)
+                        }
+                    }
+                    if readBinary {
+                        let category = FileTypeRegistry.category(for: ext)
+                        binaryText = MediaMetadata.searchableText(for: fileURL, category: category)
                     }
 
-                    batch.append(SearchableItem(url: fileURL, isDirectory: false, content: content))
+                    batch.append(SearchableItem(url: fileURL, isDirectory: false,
+                                                content: content, binaryText: binaryText))
 
                     if batch.count >= 128 {
                         let chunk = batch
@@ -147,31 +161,9 @@ enum ContentIndexer {
         return String(decoding: data, as: UTF8.self)
     }
 
-    /// Content-based binary heuristic, applied to every file that reaches this
-    /// point (including ones with a text extension): NUL bytes, invalid UTF-8,
-    /// or too many control characters (ignoring tab / newline) mean binary, so
-    /// the file's contents are never searched (it can still match by name).
+    /// Content-based binary check: the indexed binary flag and the live
+    /// content search must agree, so both use `FileProbe.looksBinary`.
     static func looksBinary(_ data: Data) -> Bool {
-        if data.isEmpty { return false }
-        if data.contains(0) { return true }
-
-        let text = String(decoding: data, as: UTF8.self)
-        var invalid = 0
-        var control = 0
-        var total = 0
-        for scalar in text.unicodeScalars {
-            total += 1
-            let value = scalar.value
-            if value == 0xFFFD {
-                invalid += 1
-            } else if (value < 0x20 && value != 0x09 && value != 0x0A && value != 0x0D)
-                        || value == 0x7F {
-                control += 1
-            }
-        }
-        // A single replacement character can just be a multibyte character cut
-        // at the probe boundary; two or more mean genuinely invalid UTF-8.
-        if invalid >= 2 { return true }
-        return total > 0 && control >= 2 && control * 100 / total > 10
+        FileProbe.looksBinary(data)
     }
 }

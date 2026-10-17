@@ -1,0 +1,60 @@
+# mff configuration — see https://github.com/m1nts02/mff
+#
+# Heavily annotated example (same keys as the template `mff config edit`
+# generates, with more commentary). Copy it to ~/.config/mff/config.toml, or
+# point mff at it with `mff --config config.example.toml`.
+
+# Paths never searched in ANY mode (indexed or live). Glob-ish patterns; add
+# more with `--exclude` on the command line.
+# exclude = ["**/node_modules", "**/.git", "*.tmp"]
+
+# Everything is configured here (no settings panel). CLI flags still win.
+[ui]
+# icons = true
+# preview = true
+# rows = 10
+# width = 720
+# keybinding = "cmd+space"   # global hotkey; keeps mff resident in the menu bar
+
+# Override icons per extension.
+# [icons.overrides]
+# rs = "dev.rust"
+
+# Optional filename index (start with `mff --index-daemon`).
+#
+# `exclude` keeps paths OUT of the index (they are still found by a live walk
+# unless also listed in the top-level `exclude`). Glob forms: `**/name` (any
+# path component), `**/name/**` (subtree), `*.ext`. A leading `~` or `${HOME}`
+# expands to your home directory (e.g. `~/Library/Caches`).
+#
+# Caches, containers, Application Support, node_modules, .git and friends are
+# always excluded automatically, whatever `volumes` is set to; listing them
+# here documents the intent and extends the set.
+# [index]
+# enabled = true                                  # may a plain mff use the daemon?
+# volumes = "auto"                                # built-in volumes (auto/none/list)
+# external_volumes = "none"                       # external: none (default) | all | list (exFAT ok)
+# exclude = [
+#     # --- dependencies / build output -------------------------------
+#     "**/node_modules", "**/bower_components", "**/vendor",
+#     "**/target", "**/build", "**/Build", "**/dist", "**/out",
+#     "**/.build", "**/.gradle", "**/.next", "**/.nuxt", "**/.svelte-kit",
+#     "**/DerivedData", "**/.xmake", "**/zig-cache", "**/zig-out",
+#     "**/__pycache__", "**/.venv", "**/venv", "**/.tox", "**/.mypy_cache",
+#     "**/.pytest_cache", "**/.ruff_cache", "**/Pods", "**/.dart_tool",
+#     # --- VCS / editor ------------------------------------------------
+#     "**/.git", "**/.hg", "**/.svn", "**/.idea", "**/.vscode",
+#     # --- macOS system metadata ---------------------------------------
+#     "**/.Spotlight-V100", "**/.fseventsd", "**/.Trashes",
+#     "**/.DocumentRevisions-V100", "**/.TemporaryItems",
+#     # --- caches (under your home; also auto-excluded) ------------------
+#     # `~` / `${HOME}` expand to your home directory, so these match only
+#     # there (unlike `**/Library/...`, which matches any Library dir).
+#     "~/Library/Caches", "~/Library/Containers",
+#     "~/Library/Application Support", "~/Library/Logs",
+#     "~/Library/Developer/Xcode/DerivedData",
+#     "~/.cache", "~/.npm", "~/.pnpm-store", "~/.yarn/cache",
+#     "~/.cargo/registry", "~/.rustup",
+#     # --- junk ---------------------------------------------------------
+#     "*.tmp", "*.log", "*.swp", "**/.DS_Store",
+# ]
