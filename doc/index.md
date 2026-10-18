@@ -84,7 +84,11 @@ exclude = ["**/node_modules", "**/DerivedData", "**/.git"]
 - Filesystems without FSEvents (exFAT/NTFS) are still indexed but cannot be kept
   fresh live — refresh with `index rebuild`.
 - In index mode `-p/--path` does not re-walk: the index covers the configured
-  volumes and the path just **restricts results to that subtree**.
+  volumes and the path just **restricts results to that subtree**. Paths are
+  normalized first (`~` expanded, relative paths joined to the current
+  directory, `.`/`..` resolved, trailing `/` dropped) and also matched through
+  symlinks (e.g. a `~/Downloads` that points into another tree), so
+  `mff -p ~/Downloads/` and `mff -p .` behave like their absolute form.
 
 The index stores each file's path, whether it looks **binary** (a `.md` that is
 really a binary blob is flagged, so it is never treated as text), and **binary

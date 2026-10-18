@@ -4,7 +4,7 @@
 
 | Option | Description |
 | --- | --- |
-| `PATH` / `-p, --path DIR` | Directory to search (repeatable; default: cwd). `--onlyin` is an alias |
+| `PATH` / `-p, --path DIR` | Directory to search (repeatable; default: cwd). `--onlyin` is an alias. Made absolute: `~` expanded, `.`/`..` resolved, trailing `/` dropped |
 | `QUERY` | Any positional that is not an existing directory or an explicit type token (`.mp3`, `kind:video`, `image,video`) is the initial query |
 | `-t, --type TYPE` | Type filter: category or extension (see [search.md](search.md#file-types)), comma-separated |
 | `--app` | Search applications by name (Launchpad-style; launches on Enter when interactive) |

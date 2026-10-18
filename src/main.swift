@@ -37,6 +37,9 @@ func printHelp() {
                            *.mp3, tar.gz, kind:video, image[,video]); a bare
                            word that is not a category is a query.
 
+    Paths (PATH / -p) are made absolute: `~` is expanded, `.` and `..` are
+    resolved, and a trailing `/` is dropped, so the index prefix matches.
+
     OPTIONS:
       --stdin [MODE]   Read items from stdin even when a path/type is given.
                        MODE: lines (default; raw strings) | files (each line is
@@ -124,6 +127,20 @@ func printVersion() {
 }
 
 // MARK: - Argument parsing
+
+/// Makes a user-supplied directory absolute: expands `~`, resolves `..` and
+/// joins it to the current directory. The index daemon matches roots by exact
+/// absolute prefix, so a relative path (`.`, `Downloads`) or one with a
+/// trailing slash would otherwise never match an indexed entry.
+func absolutePath(_ raw: String) -> String {
+    let expanded = (raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+    if expanded.isEmpty { return FileManager.default.currentDirectoryPath }
+    let absolute = expanded.hasPrefix("/")
+        ? expanded
+        : FileManager.default.currentDirectoryPath + "/" + expanded
+    // `.` components and trailing slashes are dropped; `..` is resolved too.
+    return (absolute as NSString).standardizingPath
+}
 
 /// Whether a positional is meant as a TYPE filter (as opposed to a query).
 /// Extensions must be explicit (`.mp3`, `*.mp3`, `tar.gz`) or `kind:`-prefixed;
@@ -328,7 +345,7 @@ func parseArguments(_ args: [String], configFile cfgFile: ConfigFile) -> Config 
             if i < args.count { cfg.windowWidth = CGFloat(Double(args[i]) ?? Double(cfg.windowWidth)); cliWidthSet = true }
         case "-p", "--path", "--onlyin":
             i += 1
-            if i < args.count { cfg.searchPaths.append(args[i]) }
+            if i < args.count { cfg.searchPaths.append(absolutePath(args[i])) }
         case "-t", "--type":
             i += 1
             if i < args.count, let f = parseTypeToken(args[i]) {
@@ -370,7 +387,7 @@ func parseArguments(_ args: [String], configFile cfgFile: ConfigFile) -> Config 
     // extension "agent" and show nothing.
     for p in positionals {
         if isDirectory(p) {
-            cfg.searchPaths.append(p)
+            cfg.searchPaths.append(absolutePath(p))
         } else if isExplicitTypeToken(p), let f = parseTypeToken(p) {
             cfg.typeFilter.extensions.formUnion(f.extensions)
             cfg.typeFilter.categories.formUnion(f.categories)

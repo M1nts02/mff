@@ -383,13 +383,28 @@ final class IndexDaemon {
         let prefixField = headParts.count > 1 ? String(headParts[1]) : ""
         let excludeField = headParts.count > 2 ? String(headParts[2]) : ""
 
+        // Every prefix is tried in several equivalent spellings so a client
+        // path matches the index no matter how it was written: standardized
+        // (drops "." / ".." / trailing "/"), symlink-resolved (a `~/Downloads`
+        // that is a symlink into another tree), and with FSEvents' `/private/...`
+        // spelling.
         var prefixes: [String] = []
         for raw in prefixField.split(separator: ";").map(String.init) where !raw.isEmpty {
-            prefixes.append(raw)
-            let resolved = URL(fileURLWithPath: raw).resolvingSymlinksInPath().path
-            if resolved != raw { prefixes.append(resolved) }
-            if raw.hasPrefix("/tmp/") { prefixes.append("/private" + raw) }
-            if resolved.hasPrefix("/tmp/") { prefixes.append("/private" + resolved) }
+            var forms = [raw]
+            forms.append((raw as NSString).standardizingPath)
+            forms.append(URL(fileURLWithPath: raw).resolvingSymlinksInPath().path)
+            for form in forms {
+                var spellings = [form, form.hasSuffix("/") ? String(form.dropLast()) : form + "/"]
+                // `/tmp` is a symlink to `/private/tmp`; some clients see one
+                // spelling, FSEvents the other.
+                if form.hasPrefix("/tmp/") { spellings.append("/private" + form) }
+                if form.hasPrefix("/private/tmp/") {
+                    let short = String(form.dropFirst("/private".count))
+                    spellings.append(short)
+                    spellings.append(short + "/")
+                }
+                prefixes.append(contentsOf: spellings.filter { !$0.isEmpty })
+            }
         }
         let excludePatterns = excludeField.split(separator: ";").map(String.init).filter { !$0.isEmpty }
         let excludeMatcher = excludePatterns.isEmpty ? nil : ExcludeMatcher(patterns: excludePatterns)

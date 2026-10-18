@@ -93,7 +93,7 @@ extension AppDelegate {
     func commitPathEditing() {
         guard isEditingPath, let pathField else { return }
         let raw = pathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let expanded = (raw as NSString).expandingTildeInPath
+        let expanded = PathExpansion.expand(raw)
 
         var isDir: ObjCBool = false
         guard !expanded.isEmpty,
@@ -103,7 +103,8 @@ extension AppDelegate {
             return
         }
 
-        config.searchPaths = [expanded]
+        // Absolute + standardized: the index matches roots by exact prefix.
+        config.searchPaths = [absolutePath(expanded)]
         allItems.removeAll()
         filteredMatches.removeAll()
         previewedURL = nil
