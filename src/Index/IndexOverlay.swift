@@ -99,11 +99,13 @@ final class IndexOverlay {
     /// Restores an overlay. Returns false if the file is missing/unreadable.
     @discardableResult
     func load(from url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url),
-              let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return false }
+        // A missing/corrupt file means "no overlay": the caller must not inherit
+        // a stale in-memory one (e.g. the dead-root markers from an unmount).
         added.removeAll()
         dead.removeAll()
         deadSubtrees.removeAll()
+        guard let data = try? Data(contentsOf: url),
+              let snap = try? JSONDecoder().decode(Snapshot.self, from: data) else { return false }
         for it in snap.added {
             added[it.path] = IndexEntry(path: it.path, isDirectory: it.isDir,
                                         isBinary: it.isBinary, binaryText: it.text)

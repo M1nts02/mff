@@ -29,6 +29,8 @@ final class IndexDaemon {
     private var lockFD: Int32 = -1
     /// Debounced overlay persistence.
     private var overlaySaveWork: [String: DispatchWorkItem] = [:]
+    /// Set in `installSignalHandlers` so the C signal handler can persist state.
+    private static var flushOnSignal: (() -> Void)?
 
     init(config: ConfigFile, configPath: String) {
         self.config = config
@@ -93,15 +95,20 @@ final class IndexDaemon {
 
     private func startBuild(_ shard: VolumeShard) {
         let root = shard.volume.path
+        shard.buildingSince = Date()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let started = Date()
+            let shardURL = URL(fileURLWithPath: IndexPaths.shardFile(id: shard.volume.id))
+            // Reuse binary flags + media metadata for files that did not change,
+            // so a rebuild is mostly the directory walk plus a small diff.
+            let previous = FileIndex.MediaCache.load(for: shardURL)
             let built = FileIndex.build(roots: [root],
                                         exclude: IndexResolver.effectiveExclude(self.config),
                                         includeHidden: true,
+                                        reusing: previous.isEmpty ? nil : previous,
                                         onProgress: ProgressLine.prefix("indexing \(shard.volume.name)"))
             ProgressLine.clear()
-            let shardURL = URL(fileURLWithPath: IndexPaths.shardFile(id: shard.volume.id))
             do {
                 try built.save(to: shardURL)
                 fputs("\(kAppName): built \(shard.volume.path): \(built.count) entries in \(Int(Date().timeIntervalSince(started) * 1000)) ms — done\n", stderr)
@@ -113,12 +120,22 @@ final class IndexDaemon {
 
             self.lock.lock()
             shard.index = built
+            // The build's snapshot may lag behind the events that arrived while
+            // it was walked; any of those events already recorded a newer
+            // checkpoint, which the replay after `didMount`/restart relies on.
             shard.overlay.reset()
             shard.state = .ready
             self.saveManifestLocked()
             self.lock.unlock()
 
-            try? FileManager.default.removeItem(at: URL(fileURLWithPath: IndexPaths.overlayFile(id: shard.volume.id)))
+            // Removed only when the catch-up left nothing behind: it may have
+            // written entries/checkpoints that the file on disk must reflect.
+            let overlayURL = URL(fileURLWithPath: IndexPaths.overlayFile(id: shard.volume.id))
+            if self.catchUpAfterBuild(shard) {
+                self.flushPersistence()
+            } else {
+                try? FileManager.default.removeItem(at: overlayURL)
+            }
             self.startWatching(shard)
         }
     }
@@ -177,6 +194,7 @@ final class IndexDaemon {
         guard let shard = shards[shardID], shard.isServing else { lock.unlock(); return }
         for dir in dirs where !dir.isEmpty { rescanDirectory(dir, shard: shard) }
         if batch.lastEventID > shard.lastEventID { shard.lastEventID = batch.lastEventID }
+        if shard.buildingSince != nil { shard.touchedDuringBuild.formUnion(dirs) }
         let compact = shard.overlay.shouldCompact()
         saveManifestLocked()
         lock.unlock()
@@ -189,11 +207,23 @@ final class IndexDaemon {
     /// the new index is ready.
     private func rebuildVolume(_ id: String) {
         lock.lock()
-        guard let existing = shards[id], existing.state != .building else { lock.unlock(); return }
+        // A build already in flight may be about to serve data older than the
+        // events that triggered this request; remember that one more rebuild is
+        // needed once it finishes (dropping events here left shards stale until
+        // a manual `index rebuild`).
+        guard let existing = shards[id], existing.state != .building else {
+            if shards[id]?.state == .building { shards[id]?.rebuildAgain = true }
+            lock.unlock()
+            return
+        }
         existing.state = .rebuilding
         lock.unlock()
         fputs("\(kAppName): rebuilding \(existing.volume.path)\n", stderr)
-        stopWatching(id)
+        // Keep the FSEvents stream running across the rebuild. Stopping it here
+        // loses every change made during the (slow, minutes-long) build and
+        // leaves the volume unwatched (and stale) if the stream cannot be
+        // recreated; the new base is then silently out of date until a manual
+        // `index rebuild`.
         startBuild(existing)
     }
 
@@ -265,6 +295,25 @@ final class IndexDaemon {
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2, execute: work)
     }
 
+    /// Persists every shard's overlay and the manifest **now**, cancelling the
+    /// debounced saves. Called before sleeping and before exiting: a pending
+    /// debounce (2 s) would otherwise be lost if the machine powers off.
+    private func flushPersistence() {
+        lock.lock()
+        let work = overlaySaveWork.values
+        overlaySaveWork.removeAll()
+        let pending = shardOrder.compactMap { shards[$0] }
+        saveManifestLocked()
+        lock.unlock()
+        for w in work { w.cancel() }
+        for shard in pending {
+            let url = URL(fileURLWithPath: IndexPaths.overlayFile(id: shard.volume.id))
+            lock.lock()
+            shard.overlay.save(to: url)
+            lock.unlock()
+        }
+    }
+
     private func saveOverlay(_ id: String) {
         lock.lock()
         guard let shard = shards[id] else { lock.unlock(); return }
@@ -307,6 +356,12 @@ final class IndexDaemon {
         installSignalHandlers()
         installMountObservers()
         observeAppActivation()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while true {
+                Thread.sleep(forTimeInterval: 3600)
+                self?.watchdogTick()
+            }
+        }
 
         while true {
             let clientFD = accept(listenFD, nil, nil)
@@ -415,6 +470,14 @@ final class IndexDaemon {
         // (no materialization): on a fast local disk with hundreds of thousands
         // of entries, building IndexEntry/String for every item per query was
         // slower than a live walk.
+        // Never serve a root that is not mounted right now (unclean eject; the
+        // unmount notification is best-effort, see `dropVanishedRoots`).
+        for volume in shardOrder.compactMap({ shards[$0] }).map({ $0.volume })
+        where !FileManager.default.fileExists(atPath: volume.path) {
+            volumeUnmounted(volume.path)
+        }
+        adoptConfiguredRoots()
+
         lock.lock()
         var views: [SearchView] = []
         var partial = false
@@ -547,8 +610,47 @@ final class IndexDaemon {
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: nil
         ) { [weak self] _ in
             guard let self else { return }
-            self.reloadConfigIfChanged()
-            self.resumeMissingWatchers()
+            self.watchdogTick()
+        }
+    }
+
+    /// Starts indexing configured roots that are mounted now but have no serving
+    /// shard. Mount notifications are best-effort (they never arrive for some
+    /// remounts, e.g. disk images), so this is the catch-all.
+    private func adoptConfiguredRoots() {
+        let wanted = IndexResolver(config: config).volumesToIndex()
+        lock.lock()
+        // "Known" must mean *being built or serving*: an `absent` shard (left by
+        // an eject) keeps its id, and counting it here would make a remounted
+        // disk invisible forever.
+        let activePaths = Set(shards.values
+            .filter { $0.state == .ready || $0.state == .building || $0.state == .rebuilding }
+            .map { $0.volume.path })
+        lock.unlock()
+        for volume in wanted where !activePaths.contains(volume.path) {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: volume.path, isDirectory: &isDir),
+                  isDir.boolValue else { continue }
+            volumeMounted(volume.path)
+        }
+    }
+
+    /// Hides any shard whose root is gone from the filesystem. FSEvents cannot
+    /// report a disappearance (the stream dies with the volume), so without
+    /// this an unclean eject leaves the disk's entries searchable forever.
+    private func dropVanishedRoots() {
+        lock.lock()
+        let candidates = shardOrder.compactMap { shards[$0] }
+            .filter { $0.state == .ready || $0.state == .rebuilding }
+            .map { $0.volume }
+        lock.unlock()
+        for volume in candidates {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: volume.path, isDirectory: &isDir),
+               isDir.boolValue {
+                continue
+            }
+            volumeUnmounted(volume.path)
         }
     }
 
@@ -559,6 +661,72 @@ final class IndexDaemon {
         let candidates = shards.values.filter { $0.state == .ready }
         lock.unlock()
         for shard in candidates { startWatching(shard) }
+    }
+
+    // MARK: - Freshness safety net
+
+    /// Re-applies what changed on disk while the build was running: the base is
+    /// a snapshot of the walk, so directories touched during the (slow) build
+    /// were diffed against entries the new base no longer has. Uses the same
+    /// directory diff as live events, which is cheap after a build (nothing or
+    /// little changed) and keeps the index correct without a second rebuild.
+    /// Returns true when it applied changes (the caller must persist them).
+    private func catchUpAfterBuild(_ shard: VolumeShard) -> Bool {
+        lock.lock()
+        let touched = shard.touchedDuringBuild
+        shard.touchedDuringBuild.removeAll()
+        shard.buildingSince = nil
+        let more = shard.rebuildAgain
+        shard.rebuildAgain = false
+        let serving = shard.isServing
+        lock.unlock()
+        if more { rebuildVolume(shard.volume.id) }
+        guard serving, !touched.isEmpty else { return false }
+        lock.lock()
+        for dir in touched where !dir.isEmpty { rescanDirectory(dir, shard: shard) }
+        let compact = shard.overlay.shouldCompact()
+        saveManifestLocked()
+        lock.unlock()
+        scheduleOverlaySave(shard.volume.id)
+        fputs("\(kAppName): \(shard.volume.path): caught up \(touched.count) dir(s) changed during the build\n", stderr)
+        if compact { rebuildVolume(shard.volume.id) }
+        return true
+    }
+
+    /// Hourly (and on app activation) check: a shard whose watcher is gone, or
+    /// whose checkpoint is far behind the current FSEvents id without any event
+    /// arriving, gets its stream restarted and, if that fails, a rebuild. This
+    /// is what turns "index silently went stale after days" into a self-heal.
+    private func watchdogTick() {
+        reloadConfigIfChanged()
+        // The unmount notification is not always delivered (e.g. a disk that
+        // disappeared without a clean eject); a root that is no longer mounted
+        // must stop serving regardless.
+        dropVanishedRoots()
+        adoptConfiguredRoots()
+        resumeMissingWatchers()
+        lock.lock()
+        let snapshot = shardOrder.compactMap { shards[$0] }.map {
+            ($0.volume, $0.lastEventID, $0.state)
+        }
+        lock.unlock()
+        let now = FSEventsGetCurrentEventId()
+        for (volume, checkpoint, state) in snapshot where state == .ready || state == .rebuilding {
+            guard volume.supportsEvents else { continue }
+            let lag = now > checkpoint ? now - checkpoint : 0
+            // A quiet system still has FSEvents ids advancing (background daemons
+            // write constantly); a gap this large means our stream is dead.
+            guard lag > 200_000 else { continue }
+            fputs("\(kAppName): \(volume.path): FSEvents checkpoint is \(lag) ids behind; re-watching\n", stderr)
+            stopWatching(volume.id)
+            if let shard = currentShard(volume.id), startWatching(shard) { continue }
+            rebuildVolume(volume.id)
+        }
+    }
+
+    private func currentShard(_ id: String) -> VolumeShard? {
+        lock.lock(); defer { lock.unlock() }
+        return shards[id]
     }
 
     // MARK: - Config reload
@@ -630,6 +798,15 @@ final class IndexDaemon {
 
     private func installMountObservers() {
         let nc = NSWorkspace.shared.notificationCenter
+        // Nothing runs while the Mac sleeps: flush what is still debounced so
+        // a power loss during sleep cannot lose it, and catch up right after
+        // waking instead of waiting for the hourly watchdog.
+        nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.flushPersistence()
+        }
+        nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.watchdogTick()
+        }
         nc.addObserver(forName: NSWorkspace.didMountNotification, object: nil, queue: nil) { [weak self] note in
             guard let url = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL else { return }
             self?.volumeMounted(url.path)
@@ -641,31 +818,44 @@ final class IndexDaemon {
     }
 
     private func volumeMounted(_ path: String) {
-        guard let info = VolumeIdentity.info(for: path) else { return }
-        let allowed = IndexResolver(config: config).volumesToIndex().contains { $0.id == info.id }
+        let mount = (path as NSString).standardizingPath
+        guard let info = VolumeIdentity.info(for: mount) else { return }
+        let wanted = IndexResolver(config: config).volumesToIndex()
+            .contains { $0.id == info.id || $0.path == mount }
+        // Shard keys are `<volume uuid>#<root path>`; only the mount point is
+        // stable across eject/remount, so look the shard up by root path.
+        let id = info.id + "#" + mount
+
         lock.lock()
-        let existing = shards[info.id]
+        var previous = shards[id]
+        for (key, shard) in shards where shard.volume.path == mount {
+            previous = shard
+            if key != id { shards.removeValue(forKey: key); shardOrder.removeAll { $0 == key } }
+        }
         lock.unlock()
 
-        if let current = existing, current.state == .ready {
-            // Already serving this mount (daemon started with the disk mounted,
-            // or it was configured at startup): just resume events from the
-            // checkpoint.
-            startWatching(current)
+        if let previous, previous.state == .ready || previous.state == .rebuilding {
+            // Already serving this mount (it was mounted before the daemon
+            // started): just resume events from the checkpoint.
+            startWatching(previous)
             return
         }
-        if existing != nil {
-            // The disk came back under the same id: its shard is on disk; reload
-            // it and replay FSEvents from the checkpoint instead of re-walking.
-            if let shard = reloadShard(info), startWatching(shard) || !info.supportsEvents {
-                fputs("\(kAppName): \(path) remounted; resuming\n", stderr)
+        if previous != nil || FileManager.default.fileExists(atPath: IndexPaths.shardFile(id: id)) {
+            // The disk came back at the same mount point: reload its shard from
+            // disk and replay FSEvents from the checkpoint instead of re-walking.
+            let remount = VolumeInfo(path: mount, id: id, fs: info.fs,
+                                     supportsEvents: info.supportsEvents)
+            if let shard = reloadShard(remount), startWatching(shard) || !info.supportsEvents {
+                fputs("\(kAppName): \(mount) remounted; resuming\n", stderr)
                 return
             }
         }
-        if allowed {
-            fputs("\(kAppName): \(path) mounted; building\n", stderr)
-            let shard = VolumeShard(volume: info, state: .building)
-            lock.lock(); shards[info.id] = shard; shardOrder.append(info.id); lock.unlock()
+        if wanted {
+            fputs("\(kAppName): \(mount) mounted; building\n", stderr)
+            let shard = VolumeShard(volume: VolumeInfo(path: mount, id: id, fs: info.fs,
+                                                       supportsEvents: info.supportsEvents),
+                                    state: .building)
+            lock.lock(); shards[id] = shard; shardOrder.append(id); lock.unlock()
             startBuild(shard)
         }
     }
@@ -686,16 +876,28 @@ final class IndexDaemon {
         return shard
     }
 
+    /// The mounted volume that `path` is (or was) mounted at.
+    private func shardInfos(for path: String) -> VolumeInfo? {
+        lock.lock()
+        defer { lock.unlock() }
+        return shards.values.first { $0.volume.path == path }?.volume
+    }
+
     private func volumeUnmounted(_ path: String) {
-        guard let info = VolumeIdentity.info(for: path) else { return }
+        // The mount point usually no longer exists here, so `VolumeIdentity`
+        // cannot describe it any more; match the mounted shard by path instead.
+        // (Requiring the volume info made every "hide it now" path a no-op for
+        // real ejects, leaving the disk's entries searchable after removal.)
+        guard let info = shardInfos(for: path) else { return }
         stopWatching(info.id)
         lock.lock()
         defer { lock.unlock() }
         guard let shard = shards[info.id] else { return }
-        // Hide the volume's entries immediately; keep the shard files for a fast
-        // remount.
-        shard.overlay.removeSubtree(shard.volume.path)
-        shard.overlay.save(to: URL(fileURLWithPath: IndexPaths.overlayFile(id: info.id)))
+        // Hide the volume's entries immediately. Do NOT write the overlay here:
+        // an unmount is not a deletion, and the `.ovl` file is what a remount
+        // reloads. Dropping the overlay from memory alone is enough (and it
+        // must be dropped, or the dead root would hide the reloaded shard).
+        shard.overlay.reset()
         shard.state = .absent
         shard.index = nil
         fputs("\(kAppName): \(path) unmounted\n", stderr)
@@ -765,7 +967,13 @@ final class IndexDaemon {
 
     private func installSignalHandlers() {
         signal(SIGPIPE, SIG_IGN)
+        // `index stop` and the shutdown of a launchd job arrive as SIGTERM:
+        // persist the overlays first (the debounce may still be pending), then
+        // exit. `exit()` runs atexit handlers, so plain C function pointers are
+        // fine here.
+        IndexDaemon.flushOnSignal = { [weak self] in self?.flushPersistence() }
         let cleanup: @convention(c) (Int32) -> Void = { _ in
+            IndexDaemon.flushOnSignal?()
             unlink(IndexPaths.socketPath())
             exit(0)
         }

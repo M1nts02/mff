@@ -96,6 +96,12 @@ final class VolumeShard {
     let overlay = IndexOverlay()
     /// FSEvents checkpoint: replay starts here after a restart.
     var lastEventID: UInt64 = 0
+    /// Set while a build runs; directories reported by FSEvents meanwhile are
+    /// re-diffed after it completes (the base is a snapshot of the walk).
+    var buildingSince: Date?
+    var touchedDuringBuild: Set<String> = []
+    /// Events arrived while a build was running: rebuild once more afterwards.
+    var rebuildAgain = false
     /// Entries in the base index (for status output).
     var baseCount: Int { index?.count ?? 0 }
     var totalCount: Int { baseCount + overlay.addedCount - overlay.deadCount }

@@ -32,12 +32,14 @@ enum IndexManager {
         for vol in volumes {
             fputs("\(kAppName): building \(vol.path) (\(vol.fs))…\n", stderr)
             let started = Date()
+            let shardURL = URL(fileURLWithPath: IndexPaths.shardFile(id: vol.id))
+            let previous = FileIndex.MediaCache.load(for: shardURL)
             let built = FileIndex.build(roots: [vol.path],
                                         exclude: IndexResolver.effectiveExclude(config),
                                         includeHidden: true,
+                                        reusing: previous.isEmpty ? nil : previous,
                                         onProgress: ProgressLine.prefix("indexing \(vol.name)"))
             ProgressLine.clear()
-            let shardURL = URL(fileURLWithPath: IndexPaths.shardFile(id: vol.id))
             do {
                 try built.save(to: shardURL)
                 try? FileManager.default.removeItem(at: URL(fileURLWithPath: IndexPaths.overlayFile(id: vol.id)))

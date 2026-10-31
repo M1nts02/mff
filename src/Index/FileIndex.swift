@@ -135,7 +135,13 @@ final class FileIndex {
         }
     }
 
+    /// Builds a shard. `reusing` lets an incremental rebuild skip the expensive
+    /// per-file work (binary probe + media metadata parse) for every file whose
+    /// size and modification time are unchanged; only files that are new or
+    /// changed are opened. This turns a ~90 s home-directory rebuild into the
+    /// small diff it usually is.
     static func build(roots: [String], exclude: [String], includeHidden: Bool,
+                      reusing previous: [String: MediaCache]? = nil,
                       onProgress: ((_ count: Int, _ current: String) -> Void)? = nil) -> FileIndex {
         let matcher = exclude.isEmpty ? nil : ExcludeMatcher(patterns: exclude)
 
@@ -154,6 +160,9 @@ final class FileIndex {
         // parallelizes well (multiple files in flight).
         var flags = [UInt8](repeating: 0, count: entries.count)
         var binaryTexts = [String?](repeating: nil, count: entries.count)
+        var stamps = [FileStamp?](repeating: nil, count: entries.count)
+        var cache: [String: MediaCache] = [:]
+        cache.reserveCapacity(entries.count)
         let lock = NSLock()
         var next = 0
         var done = 0
@@ -173,7 +182,16 @@ final class FileIndex {
                 let isDir = entries[i].isDir
                 var flag: UInt8 = isDir ? 1 : 0
                 var text: String?
-                if !isDir {
+                let stamp = isDir ? nil : FileStamp.read(path)
+                if isDir {
+                    flag = 1
+                } else if let stamp, let hit = previous?[path],
+                          hit.size == stamp.size, hit.mtime == stamp.mtime {
+                    // Unchanged since the previous build: reuse its binary flag
+                    // and media text instead of re-opening the file.
+                    flag = hit.flag
+                    text = hit.text.isEmpty ? nil : hit.text
+                } else {
                     let url = URL(fileURLWithPath: path)
                     let ext = url.pathExtension
                     let category = FileTypeRegistry.category(for: ext)
@@ -189,6 +207,11 @@ final class FileIndex {
                 lock.lock()
                 flags[i] = flag
                 binaryTexts[i] = text
+                stamps[i] = stamp
+                if let stamp {
+                    cache[path] = MediaCache(size: stamp.size, mtime: stamp.mtime, flag: flag,
+                                             text: text ?? "")
+                }
                 done += 1
                 let report = onProgress.map { cb -> Bool in
                     guard Date().timeIntervalSince(lastReport) > 0.25 else { return false }
@@ -225,12 +248,83 @@ final class FileIndex {
         }
         let finalFlags = Array(flags.prefix(offsets.count - 1))
 
-        return FileIndex(pathBlob: pathBlob, binaryBlob: binaryBlob, offsets: offsets,
-                         binaryOffsets: binaryOffsets, flags: finalFlags,
-                         roots: roots, builtAt: Date())
+        Self.pendingCache = cache
+        let built = FileIndex(pathBlob: pathBlob, binaryBlob: binaryBlob, offsets: offsets,
+                              binaryOffsets: binaryOffsets, flags: finalFlags,
+                              roots: roots, builtAt: Date())
+        return built
+    }
+
+    // MARK: - Incremental rebuild support
+
+    /// A file's identity for "unchanged since the last build": size and mtime.
+    /// Only regular files get a stamp; directories never carry metadata.
+    struct FileStamp: Equatable {
+        var size: Int64
+        var mtime: Int64
+
+        static func read(_ path: String) -> FileStamp? {
+            var st = stat()
+            guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+            return FileStamp(size: Int64(st.st_size),
+                             mtime: Int64(st.st_mtimespec.tv_sec) * 1_000_000_000
+                                 + Int64(st.st_mtimespec.tv_nsec))
+        }
+
+        var line: String { "\(size)\t\(mtime)" }
+        init?(line: Substring) {
+            let parts = line.split(separator: "\t")
+            guard parts.count == 2, let size = Int64(parts[0]), let mtime = Int64(parts[1]) else {
+                return nil
+            }
+            self.size = size
+            self.mtime = mtime
+        }
+        init(size: Int64, mtime: Int64) { self.size = size; self.mtime = mtime }
+    }
+
+    /// Media metadata reused from the previous build for unchanged files,
+    /// keyed by path. Written next to the shard (`.meta2`) so a rebuild only
+    /// re-parses files that are new or modified.
+    struct MediaCache {
+        var size: Int64 = 0
+        var mtime: Int64 = 0
+        var flag: UInt8 = 0
+        var text: String = ""
+
+        static func fileURL(shard: URL) -> URL { shard.appendingPathExtension("meta2").appendingPathExtension("json") }
+
+        static func load(for shard: URL) -> [String: MediaCache] {
+            guard let data = try? Data(contentsOf: fileURL(shard: shard)),
+                  let raw = try? JSONDecoder().decode([String: [String]].self, from: data) else {
+                return [:]
+            }
+            var out: [String: MediaCache] = [:]
+            out.reserveCapacity(raw.count)
+            for (path, fields) in raw where fields.count >= 4 {
+                guard let size = Int64(fields[0]), let mtime = Int64(fields[1]),
+                      let flag = UInt8(fields[2]) else { continue }
+                out[path] = MediaCache(size: size, mtime: mtime, flag: flag, text: fields[3])
+            }
+            return out
+        }
+
+        static func save(_ cache: [String: MediaCache], for shard: URL) {
+            var raw: [String: [String]] = [:]
+            raw.reserveCapacity(cache.count)
+            for (path, e) in cache {
+                raw[path] = [String(e.size), String(e.mtime), String(e.flag), e.text]
+            }
+            guard let data = try? JSONEncoder().encode(raw) else { return }
+            try? data.write(to: fileURL(shard: shard), options: .atomic)
+        }
     }
 
     // MARK: - Persistence
+
+    /// Media results of the most recent `build` in this process, written by the
+    /// following `save(to:)`.
+    private static var pendingCache: [String: MediaCache]?
 
     func save(to url: URL) throws {
         var data = Data()
@@ -255,6 +349,11 @@ final class FileIndex {
         ]
         if let metaData = try? JSONSerialization.data(withJSONObject: meta) {
             try? metaData.write(to: url.appendingPathExtension("meta"))
+        }
+        // Media cache for the next rebuild: only files that are new or whose
+        // stamp changed get re-probed / re-parsed.
+        if let cache = Self.pendingCache {
+            MediaCache.save(cache, for: url)
         }
     }
 

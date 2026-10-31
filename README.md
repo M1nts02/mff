@@ -12,6 +12,7 @@ mff ~/notes --content TODO         # files whose text contains "TODO"
 mff ~/Music --binary neon          # audio/video/image whose metadata matches
 mff --index-daemon                 # optional: start the resident index
 brew services start mff            # ...or run it as a login service
+mff -p ~/Downloads/ report -1      # index mode: print the single match
 ```
 
 ## Features
@@ -22,9 +23,11 @@ brew services start mff            # ...or run it as a login service
   `--binary` matches binary metadata (audio/video tags, image EXIF).
 - **Preview**: Quick Look, media player with cover art, plain text for
   lyrics/subtitles; FLAC/OGG/Opus tags and MKV/WebM covers parsed natively.
-- **Optional index daemon**: per-volume, FSEvents-incremental, survives restarts
-  and disk eject, re-reads `config.toml` while running; falls back to a live walk
-  whenever unavailable.
+- **Optional index daemon**: per-volume shards, FSEvents-incremental, rebuilds
+  reuse unchanged files (~6 s for a 150k-entry home tree), re-reads `config.toml`
+  while running, and stays correct across restarts, sleep/wake, disk eject and
+  remount (ejected entries disappear immediately; a re-plugged disk resumes in
+  seconds). Falls back to a live walk whenever unavailable.
 - Config lives entirely in `~/.config/mff/config.toml` (no GUI settings panel,
   no subcommands): see [doc/config.md](doc/config.md).
 

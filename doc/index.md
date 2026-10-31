@@ -31,8 +31,9 @@ mff index clean                         # delete all index files
 logged-in user (state and config are per-user). Two consequences:
 
 - The job starts at login, possibly **before external disks are mounted**. The
-  daemon picks them up when they mount, and also re-checks the config and
-  resumes watching on the next app switch — no restart needed.
+  daemon picks them up when they mount (and on the next search if the mount
+  notification is missed), re-checks the config on every connection and app
+  switch, and resumes watching after sleep — no restart needed.
 - Config edits made after the job started are picked up the same way; check
   `mff index status` if a disk still does not show up.
 
@@ -42,15 +43,37 @@ instance (exclusive lock file) and exits immediately.
 ## How it stays correct
 
 - **Per-volume shards**: `~/Library/Application Support/mff/index/manifest.json`
-  plus `vol-<uuid>#<root>.idx` (immutable base) and `...ovl` (incremental
-  overlay). A volume that is not ready is skipped and reported as `partial`.
+  plus `vol-<uuid>#<root>.idx` (immutable base), `...ovl` (incremental overlay)
+  and `...idx.meta2.json` (per-file cache used by rebuilds). A volume that is not
+  ready is skipped and reported as `partial`.
 - **FSEvents checkpoints**: event IDs are persisted and replayed after a restart,
   so changes made while the daemon was down are picked up automatically.
-- **Disk eject/remount**: an ejected volume's entries disappear immediately; a
-  remounted one resumes in seconds (its shard is kept). Mount/unmount only
-  affects that volume.
+- **Disk eject/remount**: an ejected volume's entries disappear immediately
+  (the root stops existing, which is checked on every search, so even an
+  unclean eject cannot leave them listed); a remounted disk reloads its kept
+  shard and resumes FSEvents from the checkpoint instead of re-walking. If a
+  mount notification is missed (disk images, some remounts), configured roots
+  that are mounted but not being served are adopted on the next search/watchdog
+  tick. Shards are keyed by mount point, so the same disk coming back on the
+  same path reuses its index. Mount/unmount only affects that volume.
 - **Incremental**: creates/deletes/renames are reflected within ~0.2 s; a large
   overlay folds back into a fresh base index.
+- **Never goes stale on its own**: the FSEvents stream keeps running while a
+  base is rebuilt (previously each rebuild stopped it, so a multi-minute rebuild
+  could end with the volume unwatched and the index silently frozen). Changes
+  seen during a build are re-applied from the same directory diff once it
+  finishes, and a rebuild request that arrives mid-build is queued.
+- **Rebuilds are cheap**: the previous build's binary flags and media metadata
+  are cached (`.meta2.json`) keyed by size + mtime, so a rebuild only re-opens
+  files that are new or changed (home tree with ~150k entries: ~6 s instead of
+  ~90 s).
+- **Watchdog**: hourly, on every app switch and after waking from sleep, a
+  shard whose FSEvents checkpoint has fallen far behind (or whose stream died)
+  is re-watched, and rebuilt if watching cannot be restored.
+- **Sleep & shutdown**: the debounced overlay writes are flushed immediately
+  before the Mac sleeps and when the daemon receives SIGTERM (`index stop`, logout,
+  shutdown), so nothing in the 2 s debounce window can be lost to a power loss
+  during sleep.
 - **Versioning**: `manifest.json` records the mff version that built the index
   (`appVersion`). Upgrading mff therefore rebuilds the whole index on the next
   daemon start (or `index rebuild`), and `index status` shows which version

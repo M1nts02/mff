@@ -22,6 +22,10 @@ func printHelp() {
     
       Commands:  index rebuild [--volume PATH] | clean | stop | status
       Index:     --index-daemon (start)  ·  --no-index (bypass)
+             Per-volume shards, FSEvents-incremental. Re-reads config.toml
+             while running; ejected disks disappear immediately and re-plugged
+             ones resume from their shard. Rebuilds reuse unchanged files.
+             `index status` also lists configured roots that are not indexed.
 
     ARGUMENTS:
       PATH                 Existing directory to search (repeatable).

@@ -38,7 +38,12 @@ mff ~/notes --content TODO         # files whose text contents contain "TODO"
 mff ~/Music --binary neon          # audio whose metadata matches "neon"
 mff ~/x --content --binary term    # text OR binary metadata
 mff --content --stdin files        # piped paths, search their text contents
+mff index status                   # index daemon + per-volume state
 ```
+
+When the index daemon is running, searching an external disk works the same way:
+its entries disappear as soon as it is ejected and come back (from the kept
+shard, no re-walk) when it is plugged in again.
 
 ## Preview
 
